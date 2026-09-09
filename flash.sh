@@ -27,11 +27,12 @@ PORT="COM5"
 #   FlashMode=dio, FlashFreq=80, FlashSize=4M
 FQBN="esp32:esp32:esp32c3:CDCOnBoot=cdc,PartitionScheme=min_spiffs,FlashMode=dio,FlashFreq=80,FlashSize=4M,UploadSpeed=921600,CPUFreq=160"
 
-# версия = короткий git-хеш (+ звёздочка если есть незакоммиченные правки)
-VER="$(git -C "$SKETCH" rev-parse --short HEAD 2>/dev/null || echo dev)"
-git -C "$SKETCH" diff --quiet 2>/dev/null || VER="${VER}*"
-VPROP="compiler.cpp.extra_flags=-DFW_VERSION=\"$VER\""
-echo ">>> версия сборки: $VER"
+# семантическая версия из файла VERSION + короткий git-хеш как rev
+SEMVER="$(cat "$SKETCH/VERSION" 2>/dev/null | tr -d '[:space:]' || echo 0.0.0)"
+REV="$(git -C "$SKETCH" rev-parse --short HEAD 2>/dev/null || echo dev)"
+git -C "$SKETCH" diff --quiet 2>/dev/null || REV="${REV}*"
+VPROP="compiler.cpp.extra_flags=-DFW_VER=\"$SEMVER\" -DFW_REV=\"$REV\""
+echo ">>> версия сборки: v$SEMVER  rev $REV"
 
 case "${1:-flash}" in
   build)
@@ -41,7 +42,7 @@ case "${1:-flash}" in
     OUT="$SKETCH/_build"
     "$CLI" compile --fqbn "$FQBN" --build-property "$VPROP" --output-dir "$OUT" "$SKETCH"
     echo
-    echo ">>> Файл для OTA (версия $VER):"
+    echo ">>> Файл для OTA (v$SEMVER rev $REV):"
     ls -la "$OUT"/*.ino.bin
     ;;
   monitor)
@@ -51,6 +52,6 @@ case "${1:-flash}" in
     "$CLI" compile --fqbn "$FQBN" --build-property "$VPROP" "$SKETCH"
     "$CLI" upload -p "$PORT" --fqbn "$FQBN" "$SKETCH"
     echo
-    echo ">>> Залито по USB (версия $VER). Обновлять по WiFi:  bash flash.sh bin"
+    echo ">>> Залито по USB (v$SEMVER rev $REV). Обновлять по WiFi:  bash flash.sh bin"
     ;;
 esac

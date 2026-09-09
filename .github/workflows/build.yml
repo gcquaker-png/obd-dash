@@ -37,25 +37,34 @@ jobs:
       - name: Compile
         run: |
           mkdir -p out
-          VER="${GITHUB_SHA::7}"
-          echo "firmware version: $VER"
+          SEMVER="$(tr -d '[:space:]' < VERSION)"
+          REV="${GITHUB_SHA::7}"
+          echo "firmware v$SEMVER rev $REV"
           arduino-cli compile \
             --fqbn "esp32:esp32:esp32c3:CDCOnBoot=cdc,PartitionScheme=min_spiffs,FlashMode=dio,FlashFreq=80,FlashSize=4M,UploadSpeed=921600,CPUFreq=160" \
-            --build-property "compiler.cpp.extra_flags=-DFW_VERSION=\"$VER\"" \
+            --build-property "compiler.cpp.extra_flags=-DFW_VER=\"$SEMVER\" -DFW_REV=\"$REV\"" \
             --output-dir out \
             sketch/obd_dash
 
-      - name: Rename artifact
+      - name: Prepare artifacts
+        id: art
         run: |
+          SEMVER="$(tr -d '[:space:]' < VERSION)"
           cp out/*.ino.bin firmware.bin
-          ls -la firmware.bin
+          md5sum firmware.bin | awk '{print $1}' > firmware.md5
+          echo "semver=$SEMVER" >> "$GITHUB_OUTPUT"
+          echo "--- firmware.bin ---"; ls -la firmware.bin
+          echo "--- md5 ---"; cat firmware.md5
 
       - name: Publish to 'latest' release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
-          name: Latest firmware
-          files: firmware.bin
+          name: "OBD Dash firmware v${{ steps.art.outputs.semver }}"
+          body: "v${{ steps.art.outputs.semver }} — ${{ github.sha }}"
+          files: |
+            firmware.bin
+            firmware.md5
           make_latest: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

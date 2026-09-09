@@ -11,6 +11,7 @@
 // URL прошивки для обновления «по воздуху» одной кнопкой.
 // GitHub Actions собирает и кладёт firmware.bin в релиз 'latest' при каждом пуше.
 #define FW_URL "https://github.com/gcquaker-png/obd-dash/releases/latest/download/firmware.bin"
+#define FW_MD5_URL "https://github.com/gcquaker-png/obd-dash/releases/latest/download/firmware.md5"
 #include "version.h"
 #include "dtc_db.h"
 #include "pids.h"
@@ -538,52 +539,82 @@ void webBegin() {
       return;
     }
     web.send(200, "text/html; charset=utf-8",
-      F("<meta http-equiv=refresh content='15;url=/'>Качаю прошивку с GitHub... "
-        "плата перезагрузится через ~15 сек, если всё ок. Смотри Serial при отладке."));
+      F("<meta http-equiv=refresh content='20;url=/'>Качаю прошивку с GitHub, проверяю контрольную сумму... "
+        "если всё ок — перезагрузка через ~15-20 сек. Иначе плата останется на текущей версии."));
     delay(300);
 
     WiFiClientSecure sec;
-    sec.setInsecure();               // без проверки cert — проще, для домашнего проекта ок
+    sec.setInsecure();
     HTTPClient http;
+
+    // 1) забрать ожидаемый MD5
+    http.begin(sec, FW_MD5_URL);
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    String wantMd5;
+    if (http.GET() == HTTP_CODE_OK) { wantMd5 = http.getString(); wantMd5.trim(); wantMd5.toLowerCase(); }
+    http.end();
+    Serial.printf("OTA-URL expected md5: %s\n", wantMd5.c_str());
+
+    // 2) скачать сам .bin
     http.begin(sec, FW_URL);
-    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);   // GitHub редиректит на CDN
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
     int code = http.GET();
     Serial.printf("OTA-URL HTTP %d\n", code);
     if (code != HTTP_CODE_OK) { http.end(); return; }
 
     int len = http.getSize();
-    if (!Update.begin(len > 0 ? len : UPDATE_SIZE_UNKNOWN)) { Update.printError(Serial); http.end(); return; }
+    if (len < 100000) { Serial.println("OTA-URL: too small, abort"); http.end(); return; }
+
+    if (wantMd5.length() == 32) Update.setMD5(wantMd5.c_str());   // Update сам сверит
+    if (!Update.begin(len)) { Update.printError(Serial); http.end(); return; }
+
     size_t written = Update.writeStream(http.getStream());
     Serial.printf("OTA-URL written %u / %d\n", written, len);
+    http.end();
+
+    if (written != (size_t)len) {
+      Serial.println("OTA-URL: size mismatch, abort");
+      Update.abort();
+      return;
+    }
     if (Update.end(true) && !Update.hasError()) {
-      Serial.println("OTA-URL OK, restart");
-      http.end();
-      delay(300);
+      Serial.println("OTA-URL OK (md5 verified), restart");
+      delay(400);
       ESP.restart();
     } else {
-      Update.printError(Serial);
-      http.end();
+      Serial.print("OTA-URL FAIL: "); Update.printError(Serial);
     }
   });
   web.on("/ota", HTTP_POST,
     []() {   // финал
-      bool ok = !Update.hasError();
+      bool ok = !Update.hasError() && Update.isFinished();
       web.send(200, "text/html; charset=utf-8",
         ok ? F("<meta http-equiv=refresh content='4;url=/'>OK, перезагрузка...")
-           : F("ОШИБКА прошивки. Плата не тронута."));
+           : F("ОШИБКА прошивки (файл битый/неполный). Плата осталась на текущей версии. Скачай .bin заново."));
       delay(400);
       if (ok) ESP.restart();
     },
     []() {   // приём кусками
+      static bool bad = false;
       HTTPUpload& up = web.upload();
       if (up.status == UPLOAD_FILE_START) {
-        Serial.printf("OTA start: %s\n", up.filename.c_str());
-        if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Serial);
+        bad = false;
+        Serial.printf("OTA file: %s\n", up.filename.c_str());
+        // первый байт образа ESP32 = 0xE9; проверим когда придёт
+        if (!Update.begin(UPDATE_SIZE_UNKNOWN)) { Update.printError(Serial); bad = true; }
       } else if (up.status == UPLOAD_FILE_WRITE) {
-        if (Update.write(up.buf, up.currentSize) != up.currentSize) Update.printError(Serial);
+        if (bad) return;
+        if (up.totalSize == 0 && up.currentSize > 0 && up.buf[0] != 0xE9) {
+          Serial.println("OTA: not an ESP32 image (magic != E9)");
+          Update.abort(); bad = true; return;
+        }
+        if (Update.write(up.buf, up.currentSize) != up.currentSize) { Update.printError(Serial); bad = true; }
       } else if (up.status == UPLOAD_FILE_END) {
+        if (bad) { Update.abort(); return; }
         if (Update.end(true)) Serial.printf("OTA done: %u bytes\n", up.totalSize);
         else Update.printError(Serial);
+      } else if (up.status == UPLOAD_FILE_ABORTED) {
+        Update.abort(); bad = true;
       }
     });
 
@@ -954,7 +985,7 @@ void drawParamsStatic() {
   lcd.setTextDatum(middle_center);
   lcd.setTextColor(TFT_LIGHTGREY);
   lcd.setTextSize(1);
-  lcd.drawString(String("PARAMS  v") + FW_VERSION, 120, 26);
+  lcd.drawString(String("PARAMS  v") + FW_VER, 120, 26);
   // адреса веб-морды: своя точка "OBD-Dash-XXXX" -> 192.168.4.1
   lcd.setTextColor(TFT_DARKGREY);
   lcd.drawString("AP: 192.168.4.1", 120, 216);
@@ -1243,12 +1274,13 @@ void setup() {
   lcd.setTextDatum(middle_center);
   lcd.setTextColor(TFT_WHITE);
   lcd.setTextSize(2);
-  lcd.drawString("OBD Dash", 120, 96);
+  lcd.drawString("OBD Dash", 120, 92);
   lcd.setTextSize(1);
   lcd.setTextColor(TFT_DARKGREY);
-  lcd.drawString(String("v ") + FW_VERSION, 120, 120);
+  lcd.drawString(String("v") + FW_VER, 120, 116);
+  lcd.drawString(String("rev ") + FW_REV, 120, 132);
   lcd.setTextColor(TFT_WHITE);
-  lcd.drawString("starting...", 120, 140);
+  lcd.drawString("starting...", 120, 152);
   delay(300);
 
   // держишь кнопку при включении ~1.5 c -> портал
