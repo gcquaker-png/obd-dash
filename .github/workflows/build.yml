@@ -3,10 +3,6 @@ name: build-firmware
 on:
   push:
     branches: [ main ]
-    paths:
-      - '**.ino'
-      - '**.h'
-      - '.github/workflows/build.yml'
   workflow_dispatch:
 
 jobs:
