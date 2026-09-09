@@ -25,7 +25,11 @@ jobs:
 
       - name: Install libraries
         run: |
-          arduino-cli lib install "LovyanGFX@1.2.28"
+          # 1.1.16 — единственная проверенная на этой плате (ESP32-C3 + GC9A01).
+          # 1.2.28 компилируется, но даёт ЧЁРНЫЙ ЭКРАН (проверено минимальным
+          # тестовым скетчем). 1.1.5 вообще не собирается для C3 (soc/dport_reg.h).
+          # НЕ поднимать версию без проверки на живой плате.
+          arduino-cli lib install "LovyanGFX@1.1.16"
           arduino-cli lib install "WiFiManager@2.0.17"
 
       - name: Arrange sketch folder

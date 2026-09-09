@@ -1,2 +1,5 @@
 _build/
 *.bin
+
+# локальные записи serial-логов
+drive_log*.txt

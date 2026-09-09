@@ -18,6 +18,7 @@
 #include "gear.h"
 #include "alerts.h"
 #include "accel.h"
+#include "drivelog.h"
 
 // ============================================================
 // ESP32-2424S012 (ESP32-C3) OBD-II DASHBOARD  — версия без тача
@@ -152,24 +153,38 @@ ElmState elmState = ELM_DISCONNECTED;
 // screenChanged ставит ISR кнопки; любой висящий запрос сразу бросаем.
 volatile bool screenChanged = false;
 
+// Команда + CR ОДНИМ write(). Критично: ESP32-core не включает TCP_NODELAY
+// (см. WiFiClient.cpp — setsockopt закомментирован), поэтому Nagle придерживал
+// бы второй write (одиночный '\r'), пока не придёт ACK — ~40 мс задержки
+// delayed-ACK НА КАЖДУЮ команду. Один write + setNoDelay при коннекте убирают это.
+static char elmBuf[24];
 String elmCmd(const String& cmd, uint32_t timeoutMs = 800) {
   while (elm.available()) elm.read();
-  elm.print(cmd);
-  elm.print('\r');
+  int n = cmd.length();
+  if (n > (int)sizeof(elmBuf) - 2) n = sizeof(elmBuf) - 2;
+  memcpy(elmBuf, cmd.c_str(), n);
+  elmBuf[n] = '\r';
+  elm.write((const uint8_t*)elmBuf, n + 1);   // один сегмент, без Nagle-паузы
+
   String resp;
+  resp.reserve(48);                            // без реаллокаций на каждый +=
   uint32_t t0 = millis();
   while (millis() - t0 < timeoutMs) {
-    while (elm.available()) {
-      char c = elm.read();
-      if (c == '>') {
-        resp.replace(cmd, "");
-        resp.replace("\r", " ");
-        resp.replace("\n", " ");
-        resp.trim();
-        return resp;
+    int avail = elm.available();
+    if (avail > 0) {
+      while (avail-- > 0) {
+        char c = elm.read();
+        if (c == '>') {
+          resp.replace(cmd, "");
+          resp.replace("\r", " ");
+          resp.replace("\n", " ");
+          resp.trim();
+          return resp;
+        }
+        resp += c;
       }
-      resp += c;
       t0 = millis();
+      continue;                                // данные идут — не спим
     }
     if (screenChanged) return "";   // кнопка сменила экран — бросаем запрос
     delay(1);
@@ -211,6 +226,26 @@ bool queryPid01(uint8_t pid, uint8_t* out, int maxOut, int& cnt) {
   return cnt > 0;
 }
 
+// БЫСТРЫЙ опрос одного PID (mode 01) — для RPM и скорости на GAUGE.
+// Суффикс "1" ("010C1") = «жди ровно 1 фрейм»: ELM отдаёт ответ сразу, как
+// получил его от ЭБУ, вместо ожидания своего межфреймового таймаута (~200 мс).
+// Это главный протокольный ускоритель на клонах.
+// Таймаут 300 мс: при ATST20 живой ответ приходит за ~30-80 мс, всё что дольше —
+// уже потеря, и ждать её незачем (быстрее сделать следующий запрос).
+// lastRtt — время последнего обмена с адаптером, мс. Ключевая метрика:
+// если rtt ~30-50 мс, тормозим мы; если ~200+, упёрлись в адаптер/ЭБУ.
+static uint16_t lastRtt = 0;
+bool queryFast01(uint8_t pid, uint8_t* out, int maxOut, int& cnt) {
+  char cmd[10];
+  snprintf(cmd, sizeof(cmd), "01%02X1", pid);
+  uint32_t t0 = millis();
+  String r = elmCmd(cmd, 300);
+  lastRtt = (uint16_t)(millis() - t0);
+  if (r.isEmpty()) return false;
+  cnt = parsePid(r, 0x01, pid, out, maxOut);
+  return cnt > 0;
+}
+
 // Мультизапрос: одна команда "01 <p1><p2>..." -> один ответ со всеми PID.
 // ELM327 (и большинство клонов) поддерживают до 6 PID в запросе.
 // lastMultiOk = сработал ли мультирежим (иначе откат на поштучный опрос).
@@ -233,38 +268,50 @@ static void bumpMiss(uint8_t& m, int& val, int deadVal) {
   if (++m >= MISS_LIMIT) { m = MISS_LIMIT; val = deadVal; }
 }
 
-// --- ГЛАВНЫЙ ЭКРАН: один мультизапрос на все 5 параметров ---
-// RPM(0C) SPEED(0D) COOLANT(05) LOAD(04) THROTTLE(11)
-void pollGauge() {
-  static const uint8_t P[5] = { 0x0C, 0x0D, 0x05, 0x04, 0x11 };
+// KINGBOLEN не понял мультизапрос -> опрашиваем поштучно, но РАЗДЕЛЬНО:
+// быстрые (RPM+скорость) — каждый цикл; медленные — по одному за проход.
+
+// RPM — самый частый запрос (для тахо-стрелки). Вызывать каждый цикл.
+void pollRpm() {
   uint8_t b[8]; int c;
-
-  if (lastMultiOk) {
-    String r = queryMulti(P, 5);
-    if (!r.isEmpty() && r.indexOf("41") >= 0) {
-      // вытащить каждый PID из общего ответа
-      c = parsePid(r, 0x01, 0x0C, b, 8);
-      if (c >= 2) { obd.rpm = ((b[0] << 8) | b[1]) / 4; missRpm = 0; } else bumpMiss(missRpm, obd.rpm, -1);
-      c = parsePid(r, 0x01, 0x0D, b, 8);
-      if (c >= 1) { obd.speed = b[0]; missSpd = 0; } else bumpMiss(missSpd, obd.speed, -1);
-      c = parsePid(r, 0x01, 0x05, b, 8);
-      if (c >= 1) { obd.coolant = b[0] - 40; missCool = 0; } else bumpMiss(missCool, obd.coolant, -999);
-      c = parsePid(r, 0x01, 0x04, b, 8);
-      if (c >= 1) { obd.load = b[0] * 100 / 255; missLoad = 0; } else bumpMiss(missLoad, obd.load, -1);
-      c = parsePid(r, 0x01, 0x11, b, 8);
-      if (c >= 1) { obd.throttle = b[0] * 100 / 255; missThr = 0; } else bumpMiss(missThr, obd.throttle, -1);
-      return;
-    }
-    lastMultiOk = false;          // клон не понял мультизапрос — дальше поштучно
-    Serial.println("multi-PID not supported, fallback");
+  if (queryFast01(0x0C, b, 8, c) && c >= 2) {
+    obd.rpm = ((b[0] << 8) | b[1]) / 4; missRpm = 0;
+    dlogPoll(lastRtt, obd.rpm, obd.speed);      // замер в лог
+  } else {
+    bumpMiss(missRpm, obd.rpm, -1);
+    dlogFail();
   }
+}
 
-  // fallback: поштучный опрос
-  if (queryPid01(0x0C, b, 8, c) && c >= 2) { obd.rpm = ((b[0] << 8) | b[1]) / 4; missRpm = 0; } else bumpMiss(missRpm, obd.rpm, -1);
-  if (queryPid01(0x0D, b, 8, c) && c >= 1) { obd.speed = b[0]; missSpd = 0; } else bumpMiss(missSpd, obd.speed, -1);
-  if (queryPid01(0x05, b, 8, c) && c >= 1) { obd.coolant = b[0] - 40; missCool = 0; } else bumpMiss(missCool, obd.coolant, -999);
-  if (queryPid01(0x04, b, 8, c) && c >= 1) { obd.load = b[0] * 100 / 255; missLoad = 0; } else bumpMiss(missLoad, obd.load, -1);
-  if (queryPid01(0x11, b, 8, c) && c >= 1) { obd.throttle = b[0] * 100 / 255; missThr = 0; } else bumpMiss(missThr, obd.throttle, -1);
+// Скорость — реже (для цифры и передачи хватает). Вызывать раз в ~3 цикла.
+void pollSpeed() {
+  uint8_t b[8]; int c;
+  if (queryFast01(0x0D, b, 8, c) && c >= 1) { obd.speed = b[0]; missSpd = 0; }
+  else bumpMiss(missSpd, obd.speed, -1);
+}
+
+// оставлено для alert-оверлея: RPM+скорость за раз
+void pollFast() { pollRpm(); pollSpeed(); }
+
+// МЕДЛЕННОЕ: один параметр за вызов, по кругу (темп/нагрузка/дроссель/вольты).
+void pollSlowStep() {
+  static uint8_t idx = 0;
+  uint8_t b[8]; int c;
+  switch (idx) {
+    case 0:
+      if (queryPid01(0x05, b, 8, c) && c >= 1) { obd.coolant = b[0] - 40; missCool = 0; } else bumpMiss(missCool, obd.coolant, -999);
+      break;
+    case 1:
+      if (queryPid01(0x04, b, 8, c) && c >= 1) { obd.load = b[0] * 100 / 255; missLoad = 0; } else bumpMiss(missLoad, obd.load, -1);
+      break;
+    case 2:
+      if (queryPid01(0x11, b, 8, c) && c >= 1) { obd.throttle = b[0] * 100 / 255; missThr = 0; } else bumpMiss(missThr, obd.throttle, -1);
+      break;
+    case 3:
+      pollVoltage();
+      break;
+  }
+  idx = (idx + 1) % 4;
 }
 
 // ============================================================
@@ -479,6 +526,27 @@ void webBegin() {
     web.send(200, "text/html; charset=utf-8",
              F("<meta http-equiv=refresh content='1;url=/'>Сохранено."));
   });
+  // Лог замеров текстом: и с телефона в setup-режиме, и с компа по /log
+  web.on("/log", []() {
+    String s = "sec\thz\tfails\trtt_avg\trtt_min\trtt_max\trpm_max\tspd_max\tlink\n";
+    s.reserve(2048);
+    int start = (dlog.count < LOG_SLOTS) ? 0 : dlog.head;
+    for (int i = 0; i < dlog.count; i++) {
+      const LogSlot& sl = dlog.slot[(start + i) % LOG_SLOTS];
+      char line[96];
+      snprintf(line, sizeof(line), "%u\t%.1f\t%u\t%u\t%u\t%u\t%u\t%u\t%u\n",
+               sl.sec, sl.polls / 10.0f, sl.fails, sl.rttAvg, sl.rttMin,
+               sl.rttMax, sl.rpmMax, sl.spdMax, (sl.flags & 1) ? 1 : 0);
+      s += line;
+    }
+    web.send(200, "text/plain; charset=utf-8", s);
+  });
+  web.on("/logclear", HTTP_POST, []() {
+    dlogClear(prefs);
+    web.send(200, "text/html; charset=utf-8",
+             F("<meta http-equiv=refresh content='1;url=/'>Лог очищен."));
+  });
+
   web.on("/gearreset", HTTP_POST, []() {
     gearReset(prefs);
     web.send(200, "text/html; charset=utf-8",
@@ -721,7 +789,10 @@ void elmService() {
         // connect с коротким таймаутом — иначе без адаптера блокирует
         // loop на несколько секунд и кнопка «протупливает».
         if (elm.connect(OBD_IP, OBD_PORT, 600)) {
-          Serial.println("TCP to ELM327 OK");
+          // Nagle OFF: ядро ESP32 его НЕ выключает само. Без этого каждый
+          // короткий запрос ждёт delayed-ACK (~40 мс) — главный тормоз опроса.
+          elm.setNoDelay(true);
+          Serial.println("TCP to ELM327 OK (nodelay)");
           elmState = ELM_INIT;
         } else {
           tRetry = millis();
@@ -742,6 +813,7 @@ void elmService() {
       elmCmd("ATS0", 400);   if (screenChanged) break;   // пробелы off
       elmCmd("ATH0", 400);   if (screenChanged) break;   // заголовки off
       elmCmd("ATAT1", 400);  if (screenChanged) break;   // адаптивный тайминг
+      elmCmd("ATST20", 400); if (screenChanged) break;   // потолок ожидания ЭБУ = 0x20*4 ≈ 128 мс (по умолч. ~200)
       elmCmd("ATCAF1", 400); if (screenChanged) break;   // авто-формат CAN
       // жёстко ISO 15765 500k 11-bit (почти все машины 2008+) — без авто-детекта
       elmCmd("ATSP6", 400);  if (screenChanged) break;
@@ -767,13 +839,35 @@ void elmService() {
       break;
     }
 
-    case ELM_READY:
-      if (!elm.connected() || WiFi.status() != WL_CONNECTED) {
-        Serial.println("Link lost");
+    case ELM_READY: {
+      // WiFi совсем упал — переподключаемся
+      if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("WiFi lost -> reconnect");
         obd.linkUp = false;
         elmState = ELM_DISCONNECTED;
+        break;
+      }
+      // TCP: клоны иногда «моргают» connected() — не рвём сразу,
+      // терпим до 3 подряд неудачных проверок. Проверяем раз в 500 мс:
+      // connected() — системный вызов, на горячем пути опроса он лишний.
+      static uint8_t  tcpMiss = 0;
+      static uint32_t tLink = 0;
+      if (millis() - tLink >= 500) {
+        tLink = millis();
+        if (!elm.connected()) {
+          if (++tcpMiss >= 3) {
+            Serial.println("TCP link lost -> reconnect");
+            obd.linkUp = false;
+            tcpMiss = 0;
+            dlogLinkLost();                  // отметить обрыв в логе
+            elmState = ELM_DISCONNECTED;
+          }
+        } else {
+          tcpMiss = 0;
+        }
       }
       break;
+    }
   }
 }
 
@@ -840,7 +934,7 @@ static void tachDrawAll(int active) {
 static void drawTach(int rpm) {
   if (rpm < 0) rpm = 0;
   if (rpm > RPM_MAX) rpm = RPM_MAX;
-  int active = (rpm + TACH_SEG_RPM - 1) / TACH_SEG_RPM;   // сколько сегментов «горит»
+  int active = (rpm + TACH_SEG_RPM - 1) / TACH_SEG_RPM;
   if (active > TACH_NSEG) active = TACH_NSEG;
 
   if (tachShownSeg < 0) { tachDrawAll(active); tachShownSeg = active; return; }
@@ -851,10 +945,12 @@ static void drawTach(int rpm) {
       tachDrawSeg(s, tachColor((s + 1) * TACH_SEG_RPM));
   } else {
     for (int s = active; s < tachShownSeg; s++)
-      tachDrawSeg(s, TACH_OFF);              // упали — гасим хвост
+      tachDrawSeg(s, TACH_OFF);
   }
   tachShownSeg = active;
 }
+
+static void drawTachAnim() { }   // no-op (анимация убрана)
 
 // Значение в зоне (x,y,w,h). Перерисовывает ТОЛЬКО если текст/цвет/размер
 // изменились — иначе не трогает пиксели (нет мелькания при том же значении).
@@ -1206,16 +1302,20 @@ void nextScreen() { gotoScreen((Screen)((currentScreen + 1) % SCREEN_COUNT)); }
 // свободной точке (LovyanGFX из ISR звать нельзя).
 bool btnRaw() { return digitalRead(BTN_PIN) == BTN_ACTIVE; }
 
-volatile uint8_t btnQueue = 0;   // 1 = нажатие ждёт обработки
+volatile uint8_t btnQueue     = 0;   // 1 = короткое нажатие ждёт обработки
+volatile uint8_t btnHoldQueue = 0;   // 1 = долгое удержание (режим настройки)
 
 // Таймер 1 мс. Нажатие = HIGH держится непрерывно >= 40 мс.
 // Следующее принимается только после LOW >= 40 мс (защита от повторов).
+// Удержание >= BTN_SETUP_MS непрерывно -> вход в режим настройки (AP + web).
 #define BTN_HOLD_MS    40
 #define BTN_RELEASE_MS 40
+#define BTN_SETUP_MS   1800
 void IRAM_ATTR btnTick() {
   static uint16_t highMs = 0;
   static uint16_t lowMs  = BTN_RELEASE_MS;
   static bool     armed  = true;
+  static bool     holdFired = false;
 
   if (btnRaw()) {
     lowMs = 0;
@@ -1225,8 +1325,13 @@ void IRAM_ATTR btnTick() {
       screenChanged = true;
       armed = false;
     }
+    if (!holdFired && highMs >= BTN_SETUP_MS) {
+      btnHoldQueue = 1;              // держим долго -> setup-режим
+      holdFired = true;
+    }
   } else {
     highMs = 0;
+    holdFired = false;
     if (lowMs < 60000) lowMs++;
     if (lowMs >= BTN_RELEASE_MS) armed = true;
   }
@@ -1242,8 +1347,83 @@ void btnBegin() {
   timerAlarmEnable(btnTimer);
 }
 
+// РЕЖИМ НАСТРОЙКИ: глушим STA, поднимаем чистую AP на канале 1, крутим
+// только веб-сервер. Вход и выход — долгим удержанием кнопки. Выход НЕ
+// перезагружает плату: восстанавливает AP_STA, переподключает STA и
+// возвращает управление в loop() (дашборд).
+// ESP32-C3 не держит AP+STA на разных каналах, поэтому в машине (STA к адаптеру)
+// своя точка «уезжает» за каналом адаптера и телефон её теряет. Здесь STA выключен —
+// AP стабильно на канале 1.
+void enterSetupMode() {
+  Serial.println("=== SETUP MODE (hold) ===");
+  uint64_t cid = ESP.getEfuseMac();
+  char ssid[32];
+  snprintf(ssid, sizeof(ssid), "OBD-Dash-%04X", (uint16_t)(cid & 0xFFFF));
+
+  elm.stop();
+  elmState = ELM_DISCONNECTED;
+  obd.linkUp = false;
+  WiFi.disconnect(true, false);        // рвём STA, настройки сети сохраняем
+  WiFi.mode(WIFI_AP);
+  WiFi.setSleep(false);
+  bool apok = WiFi.softAP(ssid, nullptr, 1);
+  IPAddress ip = WiFi.softAPIP();
+  Serial.printf("SETUP AP: %s ch1 %s  http://%s/\n",
+                ssid, apok ? "OK" : "FAIL", ip.toString().c_str());
+
+  lcd.fillScreen(TFT_BLACK);
+  lcd.setTextDatum(middle_center);
+  lcd.setTextColor(TFT_YELLOW);
+  lcd.setTextSize(2);
+  lcd.drawString("SETUP MODE", CX, CY - 44);
+  lcd.setTextSize(1);
+  lcd.setTextColor(TFT_WHITE);
+  lcd.drawString("WiFi:", CX, CY - 8);
+  lcd.setTextColor(TFT_CYAN);
+  lcd.drawString(ssid, CX, CY + 10);
+  lcd.setTextColor(TFT_WHITE);
+  lcd.drawString(String("http://") + ip.toString() + "/", CX, CY + 32);
+  lcd.setTextColor(TFT_DARKGREY);
+  lcd.drawString("open / OTA -> /ota", CX, CY + 54);
+  lcd.drawString("hold btn to exit", CX, CY + 72);
+
+  btnHoldQueue = 0;                    // сбросить событие входа
+  btnQueue = 0;
+  uint32_t t0 = millis();
+  for (;;) {
+    web.handleClient();
+    // выход из setup — снова долгое удержание. Игнорируем первые 1.5 с,
+    // чтобы «дожатие» кнопки при входе не выкинуло сразу обратно.
+    if (btnHoldQueue && millis() - t0 > 1500) {
+      btnHoldQueue = 0;
+      break;
+    }
+    delay(2);
+  }
+
+  // --- выход: восстановить рабочий режим без рестарта ---
+  Serial.println("=== SETUP MODE exit (hold) ===");
+  lcd.fillScreen(TFT_BLACK);
+  lcd.setTextColor(TFT_WHITE);
+  lcd.setTextSize(1);
+  lcd.drawString("reconnecting...", CX, CY);
+
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.setSleep(false);
+  WiFi.softAP(ssid, nullptr, 1);       // своя AP обратно на канал 1
+  WiFi.begin();                        // STA к сохранённой сети адаптера
+  uint32_t tw = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - tw < 8000) delay(100);
+  Serial.printf("STA %s\n", WiFi.status() == WL_CONNECTED ? "OK" : "not yet (retry in bg)");
+
+  elmState = ELM_DISCONNECTED;         // elmService переподключится сам
+  btnQueue = 0; btnHoldQueue = 0;
+  gotoScreen(currentScreen);           // перерисовать дашборд с нуля
+}
+
 // вызывается из loop() — выполняет переключение, если ISR засёк нажатие
 void handleButton() {
+  if (btnHoldQueue) { btnHoldQueue = 0; enterSetupMode(); return; }  // вход/выход по удержанию
   if (btnQueue == 0) return;
   btnQueue = 0;
   Serial.println("BTN tap -> next");
@@ -1267,7 +1447,7 @@ void setup() {
 
   bool disp = lcd.init();
   Serial.printf("lcd.init() -> %d\n", disp);
-  lcd.setRotation(0);
+  lcd.setRotation(2);   // экран перевёрнут на 180°
   lcd.setBrightness(255);
 
   lcd.fillScreen(TFT_BLACK);
@@ -1299,6 +1479,7 @@ void setup() {
   gearLoad(prefs);
   alertLoad(prefs);
   accelLoad(prefs);
+  dlogLoad(prefs);            // лог замеров (переживает перезагрузки)
 
   // --- СНАЧАЛА поднимаем свою AP (фикс. канал 1), потом STA к адаптеру ---
   // Так AP не «прыгает» за каналом STA и телефон её видит.
@@ -1328,11 +1509,21 @@ void setup() {
 // вперемешку с быстрыми — так экран обновляется плавно, без пауз.
 void loop() {
   static uint32_t tPoll = 0, tRedraw = 0, tDtc = 0, tAlert = 0;
-  static uint8_t  slowIdx = 0;
+
   static Screen   drawnScreen = (Screen)255;
   static bool     alertOn = false;
 
   handleButton();
+
+  // --- ЛОГ ЗАМЕРОВ: закрыть слот раз в 10 с и сохранить в NVS ---
+  if (dlogTick()) dlogSave(prefs);
+
+  // Дома по USB: отправить 'L' в Serial -> дамп лога, 'C' -> очистить.
+  if (Serial.available()) {
+    char c = Serial.read();
+    if (c == 'L' || c == 'l') dlogDump();
+    if (c == 'C' || c == 'c') { dlogClear(prefs); Serial.println("log cleared"); }
+  }
 
   // --- ОВЕРЛЕЙ ПРЕДУПРЕЖДЕНИЯ (приоритет над всем) ---
   AlertKind al = alertCheck(obd.rpm, obd.coolant, obd.voltage, dtcNewFlag);
@@ -1348,8 +1539,8 @@ void loop() {
     elmService();
     if (elmState == ELM_READY && millis() - tPoll >= 150) {
       tPoll = millis();
-      pollGauge();
-      if (++slowIdx >= 4) { pollVoltage(); slowIdx = 0; }   // ATRV изредка
+      pollFast();
+      pollSlowStep();
     }
     return;                                 // ничего больше не рисуем
   }
@@ -1365,7 +1556,10 @@ void loop() {
   }
   screenChanged = false;
 
-  web.handleClient();
+  // Веб-сервер не на горячем пути опроса: 20 Гц человеку незаметно,
+  // но освобождает время между OBD-запросами. В setup-режиме крутится отдельно.
+  static uint32_t tWeb = 0;
+  if (millis() - tWeb >= 50) { tWeb = millis(); web.handleClient(); }
   elmService();
   bool ready = demoOn || (elmState == ELM_READY);
 
@@ -1385,18 +1579,28 @@ void loop() {
     return;
   }
 
-  // --- GAUGE: мультизапрос как можно чаще, перерисовка СРАЗУ после ---
+  // --- GAUGE: RPM и скорость чередуются 2:1, медленное 1/1.2с ---
+  // Скорость нужна не только для цифры, но и для авто-калибровки передач,
+  // поэтому тянем её почаще: каждый 2-й опрос + гарантированно раз в 400 мс.
   if (currentScreen == SCREEN_GAUGE) {
-    if (ready && millis() - tPoll >= 20) {   // почти без паузы — упираемся в адаптер
+    static uint32_t tSlow = 0, tSpd = 0;
+    static uint8_t  fastCnt = 0;
+    if (ready && millis() - tPoll >= 10) {
       tPoll = millis();
-      pollGauge();
-      if (++slowIdx >= 6) { pollVoltage(); slowIdx = 0; }
+      pollRpm();                             // приоритет — тахо
+      if (++fastCnt >= 2 || millis() - tSpd >= 400) {
+        fastCnt = 0; tSpd = millis();
+        pollSpeed();
+      }
+      if (millis() - tSlow >= 1200) { tSlow = millis(); pollSlowStep(); }
       if (gearUpdate(obd.rpm, obd.speed, obd.throttle)) gearSave(prefs);
       if (accelUpdate(obd.speed)) accelSave(prefs);
-      drawGaugeValues();                     // рисуем со свежими данными
-    } else if (!ready && millis() - tRedraw >= 300) {
-      tRedraw = millis();
-      drawGaugeValues();                     // без адаптера — просто освежаем "--"
+      drawGaugeValues();
+    } else {
+      // между опросами — гоним интерполяцию тахо-дуги для плавности
+      static uint32_t tAnim = 0;
+      if (millis() - tAnim >= 30) { tAnim = millis(); drawTachAnim(); }
+      if (!ready && millis() - tRedraw >= 300) { tRedraw = millis(); drawGaugeValues(); }
     }
   }
 
