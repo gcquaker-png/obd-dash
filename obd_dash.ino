@@ -808,9 +808,13 @@ void connectWiFi(bool forcePortal) {
   if (!forcePortal) {
     // Приоритет: сеть OBD-адаптера (slot 0). Если её нет в эфире —
     // подключаемся к сохранённой домашней сети (для OTA/веб-морды).
-    if (nets.count > 0 && nets.net[0].ssid[0]) {
+    // Достаточно ЛЮБОЙ заполненной сети в списке — слот 0 (OBD) может
+    // быть пустым, если настроена только запасная домашняя сеть.
+    bool haveAny = false;
+    for (int i = 0; i < NET_MAX; i++) if (nets.net[i].ssid[0]) { haveAny = true; break; }
+    if (haveAny) {
       if (netConnectBest() < 0)
-        Serial.println("известных сетей нет — ретрай в фоне");
+        Serial.println("известных сетей нет в эфире — ретрай в фоне");
     } else {
       // список ещё не заполнен (первый запуск после обновления) —
       // используем сеть из WiFiManager и запоминаем её как OBD-сеть
@@ -905,8 +909,10 @@ void elmService() {
           elmState = ELM_DISCONNECTED;   // пауза 1.5 c до следующей попытки
         }
       } else if (millis() - tMark > 15000) {
+        // Переподключаемся по списку с приоритетом: в движении сеть
+        // адаптера может появиться позже домашней (или наоборот).
         Serial.println("WiFi lost, reconnecting");
-        WiFi.reconnect();
+        if (netConnectBest(6000) < 0) WiFi.reconnect();
         tRetry = millis();
         elmState = ELM_DISCONNECTED;
       }
@@ -1685,6 +1691,21 @@ void loop() {
     char c = Serial.read();
     if (c == 'L' || c == 'l') dlogDump();
     if (c == 'C' || c == 'c') { dlogClear(prefs); Serial.println("log cleared"); }
+    if (c == 'N' || c == 'n') {          // показать сохранённые сети
+      Serial.printf("nets: count=%u\n", nets.count);
+      for (int i = 0; i < NET_MAX; i++)
+        Serial.printf("  [%d] ssid='%s' pass=%s\n", i, nets.net[i].ssid,
+                      nets.net[i].pass[0] ? "есть" : "(нет)");
+      Serial.printf("STA status=%d SSID='%s'\n", WiFi.status(), WiFi.SSID().c_str());
+    }
+    if (c == 'S' || c == 's') {          // скан эфира
+      int n = WiFi.scanNetworks();
+      Serial.printf("видно %d сетей:\n", n);
+      for (int i = 0; i < n; i++)
+        Serial.printf("  %s  %d dBm  ch%d\n", WiFi.SSID(i).c_str(),
+                      WiFi.RSSI(i), WiFi.channel(i));
+      WiFi.scanDelete();
+    }
   }
 
   // --- ОВЕРЛЕЙ ПРЕДУПРЕЖДЕНИЯ (приоритет над всем) ---

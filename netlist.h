@@ -70,13 +70,15 @@ inline void netClear(Preferences& p, int slot) {
 // только она. Иначе первая найденная из запасных.
 inline int netConnectBest(uint32_t perNetTimeoutMs = 8000) {
   netActive = -1; netIsObd = false;
-  if (nets.count == 0) return -1;
 
   int n = WiFi.scanNetworks(false, false);
   Serial.printf("scan: %d сетей\n", n);
+  if (n <= 0) { WiFi.scanDelete(); return -1; }
 
+  // Идём по ВСЕМ слотам, а не по nets.count: count — это «до какого слота
+  // писали», а заполненным может быть любой (например только запасной).
   int pick = -1;
-  for (int slot = 0; slot < nets.count && pick < 0; slot++) {
+  for (int slot = 0; slot < NET_MAX && pick < 0; slot++) {
     if (!nets.net[slot].ssid[0]) continue;
     for (int i = 0; i < n; i++) {
       if (WiFi.SSID(i) == nets.net[slot].ssid) { pick = slot; break; }
