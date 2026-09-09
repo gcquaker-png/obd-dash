@@ -1,0 +1,56 @@
+name: build-firmware
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - '**.ino'
+      - '**.h'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install arduino-cli
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh -s
+          echo "$PWD/bin" >> $GITHUB_PATH
+
+      - name: Install ESP32 core 2.0.13
+        run: |
+          arduino-cli config init
+          arduino-cli config set board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32@2.0.13
+
+      - name: Install libraries
+        run: |
+          arduino-cli lib install "LovyanGFX@1.2.28"
+          arduino-cli lib install "WiFiManager@2.0.17"
+
+      - name: Compile
+        run: |
+          mkdir -p out
+          arduino-cli compile \
+            --fqbn "esp32:esp32:esp32c3:CDCOnBoot=cdc,PartitionScheme=min_spiffs,FlashMode=dio,FlashFreq=80,FlashSize=4M,UploadSpeed=921600,CPUFreq=160" \
+            --output-dir out \
+            .
+
+      - name: Rename artifact
+        run: |
+          cp out/*.ino.bin firmware.bin
+          ls -la firmware.bin
+
+      - name: Publish to 'latest' release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Latest firmware
+          files: firmware.bin
+          make_latest: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
