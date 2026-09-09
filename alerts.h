@@ -34,14 +34,28 @@ inline void alertSave(Preferences& p) {
 
 // Проверить условия. rpm/coolant/voltage — текущие; newDtc — флаг что
 // при последнем чтении кодов появился новый. Возвращает вид тревоги.
-inline AlertKind alertCheck(int rpm, int coolant, float voltage, bool newDtc) {
-  AlertKind k = AL_NONE;
-  if (coolant > -200 && coolant >= alertCfg.coolMax)              k = AL_OVERHEAT;
-  else if (rpm > 500 && voltage > 0 && voltage < alertCfg.voltMin) k = AL_LOWVOLT;
-  else if (rpm >= alertCfg.rpmMax)                                k = AL_REDLINE;
-  else if (newDtc)                                                k = AL_NEWDTC;
+// При пуске стартер сажает бортсеть до 9-10 В — это норма, а не «нет заряда».
+// Обороты за 500 появляются уже во время прокрутки, поэтому одного порога
+// по RPM мало: ждём, пока двигатель устойчиво поработает ALERT_VOLT_DELAY_MS,
+// и только потом смотрим на напряжение. Счётчик сбрасывается при глушении.
+#define ALERT_VOLT_DELAY_MS 8000
+#define ALERT_RUN_RPM       600
+static uint32_t engRunSince = 0;
 
+inline AlertKind alertCheck(int rpm, int coolant, float voltage, bool newDtc) {
   uint32_t now = millis();
+
+  // отслеживаем, сколько двигатель непрерывно работает
+  if (rpm > ALERT_RUN_RPM) { if (engRunSince == 0) engRunSince = now; }
+  else                       engRunSince = 0;
+  bool engineWarm = engRunSince && (now - engRunSince >= ALERT_VOLT_DELAY_MS);
+
+  AlertKind k = AL_NONE;
+  if (coolant > -200 && coolant >= alertCfg.coolMax)                 k = AL_OVERHEAT;
+  else if (engineWarm && voltage > 0 && voltage < alertCfg.voltMin)   k = AL_LOWVOLT;
+  else if (rpm >= alertCfg.rpmMax)                                   k = AL_REDLINE;
+  else if (newDtc)                                                   k = AL_NEWDTC;
+
   if (k != AL_NONE) {
     if (alertActive != k) { alertActive = k; alertSince = now; }
   } else if (alertActive != AL_NONE && now - alertSince > 3000) {

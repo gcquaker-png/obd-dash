@@ -11,9 +11,15 @@
 // ============================================================
 
 #define GEAR_MAX        7      // физический предел массива
-#define GEAR_MIN_SPEED  20     // ниже — не калибруем и не показываем
+// 8 км/ч: на первой передаче скорость обычно 5-15 км/ч, при пороге 20
+// она не попадала в окно калибровки и не определялась никогда.
+#define GEAR_MIN_SPEED  8      // ниже — не калибруем и не показываем
 #define GEAR_MIN_RPM    1100   // ниже — считаем нейтраль/накат (не ищем передачу)
+// На первой передаче устойчивый участок короткий (быстро переключаются),
+// поэтому окно короче: 1600 мс на первой почти не поймать.
 #define GEAR_STABLE_MS  1600   // держать стабильные rpm/speed столько
+#define GEAR_STABLE_LOW 900    // то же, но для низких скоростей (1-я передача)
+#define GEAR_LOW_SPEED  25     // ниже этой скорости считаем «низкой» (1-2 передача)
 #define GEAR_RPM_TOL    100    // допуск дрожания rpm за окно
 #define GEAR_SPD_TOL    2      // допуск дрожания скорости, км/ч
 #define GEAR_THR_MIN    8      // дроссель НИЖЕ — накат, НЕ калибруем (ключевой фикс)
@@ -134,7 +140,10 @@ inline bool gearUpdate(int rpm, int speed, int throttle) {
     return false;
   }
 
-  if (now - winStart >= GEAR_STABLE_MS) {
+  // на низкой скорости (1-2 передача) устойчивый участок короткий —
+  // требуем меньше времени, иначе первая никогда не наберётся
+  uint32_t needMs = (speed < GEAR_LOW_SPEED) ? GEAR_STABLE_LOW : GEAR_STABLE_MS;
+  if (now - winStart >= needMs) {
     float rr = (float)((rMin + rMax) / 2) / ((sMin + sMax) / 2.0f);
     int before = gears.count;
     gearLearn(rr);

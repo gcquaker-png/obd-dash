@@ -19,6 +19,7 @@
 #include "alerts.h"
 #include "accel.h"
 #include "drivelog.h"
+#include "netlist.h"
 
 // ============================================================
 // ESP32-2424S012 (ESP32-C3) OBD-II DASHBOARD  — версия без тача
@@ -232,17 +233,57 @@ bool queryPid01(uint8_t pid, uint8_t* out, int maxOut, int& cnt) {
 // Это главный протокольный ускоритель на клонах.
 // Таймаут 300 мс: при ATST20 живой ответ приходит за ~30-80 мс, всё что дольше —
 // уже потеря, и ждать её незачем (быстрее сделать следующий запрос).
-// lastRtt — время последнего обмена с адаптером, мс. Ключевая метрика:
-// если rtt ~30-50 мс, тормозим мы; если ~200+, упёрлись в адаптер/ЭБУ.
+// lastRtt — время последнего обмена с адаптером, мс.
+// Замер показал rtt ~37 мс стабильно: адаптер быстрый, потолок ~27 Гц.
+// Реальная частота падала из-за ПОТЕРЬ: каждый таймаут съедал 300 мс.
+// Теперь таймаут 150 мс (в 4 раза больше типичного ответа — с запасом),
+// и различаем причину: пустой ответ (таймаут) vs ответ есть, но не распарсен.
 static uint16_t lastRtt = 0;
+static bool     lastWasTimeout = false;
+#define FAST_TIMEOUT_MS 150
+
+// Суффикс числа фреймов ("010C1") ускоряет ответ: ELM отдаёт данные сразу,
+// не дожидаясь межфреймового таймаута. НО не все клоны его понимают —
+// замер показал, что этот KINGBOLEN на часть таких команд отвечает "?"
+// («не понял»), и запрос уходит в никуда. Поэтому: пробуем с суффиксом,
+// на первом же "?" переключаемся на обычный формат до перезагрузки.
+static bool fastSuffixOk = true;
+
 bool queryFast01(uint8_t pid, uint8_t* out, int maxOut, int& cnt) {
   char cmd[10];
-  snprintf(cmd, sizeof(cmd), "01%02X1", pid);
+  if (fastSuffixOk) snprintf(cmd, sizeof(cmd), "01%02X1", pid);
+  else              snprintf(cmd, sizeof(cmd), "01%02X",  pid);
+
   uint32_t t0 = millis();
-  String r = elmCmd(cmd, 300);
+  String r = elmCmd(cmd, FAST_TIMEOUT_MS);
   lastRtt = (uint16_t)(millis() - t0);
-  if (r.isEmpty()) return false;
+  if (r.isEmpty()) { lastWasTimeout = true; return false; }
+  lastWasTimeout = false;
+
+  // "?" = адаптер не понял команду. Если это был запрос с суффиксом —
+  // значит клон его не поддерживает: отключаем и повторяем без него.
+  if (r.indexOf('?') >= 0) {
+    if (fastSuffixOk) {
+      fastSuffixOk = false;
+      Serial.println("ELM: суффикс кадров не поддержан -> обычный формат");
+      dlogSuffixOff();
+      snprintf(cmd, sizeof(cmd), "01%02X", pid);
+      t0 = millis();
+      r = elmCmd(cmd, FAST_TIMEOUT_MS);
+      lastRtt = (uint16_t)(millis() - t0);
+      if (r.isEmpty()) { lastWasTimeout = true; return false; }
+    }
+  }
+
   cnt = parsePid(r, 0x01, pid, out, maxOut);
+  if (cnt <= 0) {
+    dlogBadResp(r.c_str());               // образец в лог (переживёт поездку)
+    static uint32_t tBad = 0;
+    if (millis() - tBad >= 2000) {
+      tBad = millis();
+      Serial.printf("BAD RESP pid=%02X: [%s]\n", pid, r.c_str());
+    }
+  }
   return cnt > 0;
 }
 
@@ -279,7 +320,7 @@ void pollRpm() {
     dlogPoll(lastRtt, obd.rpm, obd.speed);      // замер в лог
   } else {
     bumpMiss(missRpm, obd.rpm, -1);
-    dlogFail();
+    dlogFail(lastWasTimeout);
   }
 }
 
@@ -464,6 +505,28 @@ String webPage() {
   }
   h += F("<button type=submit>Сохранить</button></form>");
 
+  // --- WiFi-сети с приоритетом ---
+  h += F("<h1 style=margin-top:28px>WiFi-сети</h1>"
+         "<p style=color:#888>Слот 1 — сеть OBD-адаптера, у неё приоритет. "
+         "Если её нет в эфире, плата подключится к следующей из списка.</p>"
+         "<form method=POST action=/nets>");
+  for (int i = 0; i < NET_MAX; i++) {
+    h += "<div style=margin-bottom:6px>";
+    if (i == 0) h += F("<b>1. OBD-адаптер</b><br>");
+    else        h += "<b>" + String(i + 1) + ". запасная</b><br>";
+    h += "<input name=s" + String(i) + " placeholder='SSID' value='" +
+         String(nets.net[i].ssid) + "' style='width:45%'> ";
+    h += "<input name=p" + String(i) + " placeholder='пароль' value='" +
+         String(nets.net[i].pass) + "' style='width:45%'>";
+    h += "</div>";
+  }
+  h += F("<button type=submit>Сохранить сети</button></form>");
+  h += "<p style=color:#888>Сейчас: ";
+  if (WiFi.status() == WL_CONNECTED)
+    h += "<b>" + WiFi.SSID() + "</b>" + (netIsObd ? " (OBD)" : " (запасная)");
+  else h += "нет подключения";
+  h += F("</p>");
+
   // --- блок калибровки передач ---
   h += F("<h1 style=margin-top:28px>Передачи</h1>");
   h += F("<form method=POST action=/geartarget>Всего передач у машины: "
@@ -528,19 +591,35 @@ void webBegin() {
   });
   // Лог замеров текстом: и с телефона в setup-режиме, и с компа по /log
   web.on("/log", []() {
-    String s = "sec\thz\tfails\trtt_avg\trtt_min\trtt_max\trpm_max\tspd_max\tlink\n";
+    String s = "sec\thz\tfails\ttouts\trtt_avg\trtt_min\trtt_max\trpm_max\tspd_max\tlink\n";
     s.reserve(2048);
     int start = (dlog.count < LOG_SLOTS) ? 0 : dlog.head;
     for (int i = 0; i < dlog.count; i++) {
       const LogSlot& sl = dlog.slot[(start + i) % LOG_SLOTS];
-      char line[96];
-      snprintf(line, sizeof(line), "%u\t%.1f\t%u\t%u\t%u\t%u\t%u\t%u\t%u\n",
-               sl.sec, sl.polls / 10.0f, sl.fails, sl.rttAvg, sl.rttMin,
+      char line[110];
+      snprintf(line, sizeof(line), "%u\t%.1f\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\n",
+               sl.sec, sl.polls / 10.0f, sl.fails, sl.touts, sl.rttAvg, sl.rttMin,
                sl.rttMax, sl.rpmMax, sl.spdMax, (sl.flags & 1) ? 1 : 0);
       s += line;
     }
     web.send(200, "text/plain; charset=utf-8", s);
   });
+  // Сохранённые WiFi-сети. Слот 0 — сеть OBD-адаптера (приоритет),
+  // слоты 1..3 — запасные (дом/работа) для OTA и веб-морды.
+  web.on("/nets", HTTP_POST, []() {
+    for (int i = 0; i < NET_MAX; i++) {
+      String ks = "s" + String(i), kp = "p" + String(i);
+      if (web.hasArg(ks)) {
+        String ss = web.arg(ks), pp = web.hasArg(kp) ? web.arg(kp) : "";
+        ss.trim();
+        if (ss.length()) netSet(prefs, i, ss.c_str(), pp.c_str());
+        else if (i > 0)  netClear(prefs, i);
+      }
+    }
+    web.send(200, "text/html; charset=utf-8",
+             F("<meta http-equiv=refresh content='1;url=/'>Сети сохранены."));
+  });
+
   web.on("/logclear", HTTP_POST, []() {
     dlogClear(prefs);
     web.send(200, "text/html; charset=utf-8",
@@ -713,18 +792,31 @@ void connectWiFi(bool forcePortal) {
   // Режим уже WIFI_AP_STA (AP поднята в setup ДО нас) — не трогаем mode,
   // иначе уроним свою точку доступа.
   if (!forcePortal) {
-    WiFi.begin();                     // подключение к последней сохранённой STA
-    Serial.print("WiFi connecting");
-    uint32_t t0 = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) {
-      delay(200); Serial.print(".");
+    // Приоритет: сеть OBD-адаптера (slot 0). Если её нет в эфире —
+    // подключаемся к сохранённой домашней сети (для OTA/веб-морды).
+    if (nets.count > 0 && nets.net[0].ssid[0]) {
+      if (netConnectBest() < 0)
+        Serial.println("известных сетей нет — ретрай в фоне");
+    } else {
+      // список ещё не заполнен (первый запуск после обновления) —
+      // используем сеть из WiFiManager и запоминаем её как OBD-сеть
+      WiFi.begin();
+      Serial.print("WiFi connecting");
+      uint32_t t0 = millis();
+      while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) {
+        delay(200); Serial.print(".");
+      }
+      Serial.println();
+      if (WiFi.status() == WL_CONNECTED) {
+        Serial.printf("WiFi OK  SSID=%s  IP=%s\n",
+                      WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+        netSet(prefs, 0, WiFi.SSID().c_str(), WiFi.psk().c_str());
+        netActive = 0; netIsObd = true;
+        Serial.println("сеть запомнена как OBD (slot 0)");
+      } else {
+        Serial.println("WiFi not connected — работаем без сети, ретрай в фоне");
+      }
     }
-    Serial.println();
-    if (WiFi.status() == WL_CONNECTED)
-      Serial.printf("WiFi OK  SSID=%s  IP=%s\n",
-                    WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
-    else
-      Serial.println("WiFi not connected — работаем без сети, ретрай в фоне");
     Serial.printf("OBD target %s:%u\n", host.c_str(), port);
     return;
   }
@@ -859,7 +951,8 @@ void elmService() {
             Serial.println("TCP link lost -> reconnect");
             obd.linkUp = false;
             tcpMiss = 0;
-            dlogLinkLost();                  // отметить обрыв в логе
+            dlogLinkLost();                  // отметить обрыв в слоте
+            dlogEvent(EV_LINKLOST, 0);       // и в журнале аномалий
             elmState = ELM_DISCONNECTED;
           }
         } else {
@@ -1014,12 +1107,53 @@ void drawGaugeStatic() {
   label(164, 137, "GEAR");
   label(78,  185, "TEMP");
   label(164, 185, "BATT");
-  // индикатор связи — по центру снизу, внутри дуги
-  lcd.setTextDatum(middle_center);
-  lcd.setTextColor(obd.linkUp ? TFT_GREEN : TFT_RED);
-  lcd.setTextSize(1);
-  lcd.drawString(obd.linkUp ? "OBD OK" : "OBD --", 120, 214);
+  // статус связи и значок ошибок рисует drawGaugeIcons() —
+  // они меняются на ходу, поэтому не в статике
 }
+
+// --- ИКОНКИ СОСТОЯНИЯ (низ экрана, внутри дуги) ---
+// Слева: связь. "OBD" зелёным — подключены к адаптеру и он отвечает;
+//        "WIFI" синим — сети адаптера нет, сидим на запасной сети;
+//        "--" серым — связи нет вовсе.
+// Справа: восклицательный знак в круге, если есть коды ошибок.
+static int iconLastLink = -99;
+static int iconLastErr  = -1;
+static void gaugeIconsReset() { iconLastLink = -99; iconLastErr = -1; }
+
+static void drawGaugeIcons() {
+  int& lastLink = iconLastLink;
+  int& lastErr  = iconLastErr;
+
+  // 2 = OBD-адаптер отвечает, 1 = только WiFi (запасная сеть), 0 = нет связи
+  int link = 0;
+  if (obd.linkUp)                                  link = 2;
+  else if (WiFi.status() == WL_CONNECTED)          link = netIsObd ? 2 : 1;
+  int err = (dtcValid && dtcList.length() > 0) ? 1 : 0;
+
+  if (link != lastLink) {
+    lastLink = link;
+    lcd.fillRect(60, 204, 84, 20, TFT_BLACK);
+    lcd.setTextDatum(middle_center);
+    lcd.setTextSize(1);
+    if (link == 2)      { lcd.setTextColor(TFT_GREEN);    lcd.drawString("OBD",  102, 214); }
+    else if (link == 1) { lcd.setTextColor(TFT_CYAN);     lcd.drawString("WIFI", 102, 214); }
+    else                { lcd.setTextColor(TFT_DARKGREY); lcd.drawString("--",   102, 214); }
+  }
+
+  if (err != lastErr) {
+    lastErr = err;
+    lcd.fillRect(146, 202, 24, 24, TFT_BLACK);
+    if (err) {                                  // (!) — есть коды ошибок
+      lcd.drawCircle(157, 214, 9, TFT_RED);
+      lcd.drawFastVLine(157, 209, 6, TFT_RED);
+      lcd.drawPixel(157, 218, TFT_RED);
+      lcd.drawPixel(158, 209, TFT_RED);         // чуть жирнее ствол
+      lcd.drawFastVLine(158, 209, 6, TFT_RED);
+      lcd.drawPixel(158, 218, TFT_RED);
+    }
+  }
+}
+
 
 void drawGaugeValues() {
   char b[16];
@@ -1060,6 +1194,8 @@ void drawGaugeValues() {
     dtostrf(obd.voltage, 0, 1, b);
   } else { strcpy(b, "--"); vcol = TFT_DARKGREY; }
   fieldId(4, 120, 150, 84, 30, b, vcol, 3);
+
+  drawGaugeIcons();          // связь (OBD/WIFI) + значок ошибок
 }
 
 // ------------------------------------------------------------
@@ -1263,6 +1399,7 @@ void drawScreen(Screen s) {
     tachReset();
     paramsStaticDrawn = false;
     fieldsReset();
+    gaugeIconsReset();
   }
   switch (s) {
     case SCREEN_GAUGE:
@@ -1480,6 +1617,7 @@ void setup() {
   alertLoad(prefs);
   accelLoad(prefs);
   dlogLoad(prefs);            // лог замеров (переживает перезагрузки)
+  netLoad(prefs);             // список WiFi-сетей с приоритетом
 
   // --- СНАЧАЛА поднимаем свою AP (фикс. канал 1), потом STA к адаптеру ---
   // Так AP не «прыгает» за каналом STA и телефон её видит.
@@ -1530,6 +1668,14 @@ void loop() {
   if (al != AL_NONE) {
     dtcNewFlag = false;                     // приняли к сведению
     alertOn = true;
+    // записать аномалию в журнал (дубликаты за 30 с отсекаются внутри)
+    switch (al) {
+      case AL_OVERHEAT: dlogEvent(EV_OVERHEAT, obd.coolant); break;
+      case AL_LOWVOLT:  dlogEvent(EV_LOWVOLT, (int16_t)(obd.voltage * 10)); break;
+      case AL_REDLINE:  dlogEvent(EV_REDLINE, obd.rpm); break;
+      case AL_NEWDTC:   dlogEvent(EV_DTC, 0); break;
+      default: break;
+    }
     if (millis() - tAlert >= 400) {         // мигание 2.5 Гц
       tAlert = millis();
       drawAlertOverlay(al);
@@ -1593,6 +1739,10 @@ void loop() {
         pollSpeed();
       }
       if (millis() - tSlow >= 1200) { tSlow = millis(); pollSlowStep(); }
+      // Фоновое чтение кодов раз в 60 с — только чтобы знать, зажигать ли
+      // значок (!) на главном. Запрос "03" небыстрый, потому так редко.
+      static uint32_t tDtcBg = 0;
+      if (millis() - tDtcBg >= 60000) { tDtcBg = millis(); pollDtc(); }
       if (gearUpdate(obd.rpm, obd.speed, obd.throttle)) gearSave(prefs);
       if (accelUpdate(obd.speed)) accelSave(prefs);
       drawGaugeValues();
