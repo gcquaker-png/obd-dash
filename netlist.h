@@ -31,6 +31,7 @@ static NetList nets = { 0x7E, 0, {} };
 // какая сеть сейчас используется: 0 = OBD, >0 = запасная, -1 = нет связи
 static int  netActive = -1;
 static bool netIsObd  = false;
+static bool netDirty  = false;   // список изменён (автоопределение) — сохранить
 
 inline void netLoad(Preferences& p) {
   p.begin("obd", true);
@@ -86,7 +87,51 @@ inline int netConnectBest(uint32_t perNetTimeoutMs = 8000) {
     // слот 0 = OBD: если он есть в эфире, других не рассматриваем
     if (pick == 0) break;
   }
+
+  // АВТООПРЕДЕЛЕНИЕ адаптера: слот 0 не настроен (или его сети нет),
+  // но в эфире висит открытая сеть с характерным именем — это почти
+  // наверняка ELM327-клон. Приоритет выше запасных сетей.
+  String autoSsid;
+  if (pick != 0) {
+    for (int i = 0; i < n; i++) {
+      String s = WiFi.SSID(i);
+      String u = s; u.toUpperCase();
+      bool looksObd = (u.indexOf("OBD") >= 0 || u.indexOf("ELM") >= 0 ||
+                       u.indexOf("VLINK") >= 0 || u.indexOf("VGATE") >= 0 ||
+                       u.indexOf("KONNWEI") >= 0);
+      // своя точка настройки — не адаптер
+      if (u.indexOf("OBD-DASH") >= 0) looksObd = false;
+      if (looksObd && WiFi.encryptionType(i) == WIFI_AUTH_OPEN) {
+        autoSsid = s;
+        break;
+      }
+    }
+  }
   WiFi.scanDelete();
+
+  if (autoSsid.length()) {
+    Serial.printf("авто-адаптер: открытая сеть [%s]\n", autoSsid.c_str());
+    WiFi.begin(autoSsid.c_str());
+    uint32_t ta = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - ta < perNetTimeoutMs) delay(150);
+    if (WiFi.status() == WL_CONNECTED) {
+      netActive = 0; netIsObd = true;
+      Serial.printf("WiFi OK [%s] IP=%s  (OBD, автоопределение)\n",
+                    autoSsid.c_str(), WiFi.localIP().toString().c_str());
+      // запомнить как сеть адаптера, чтобы дальше работал обычный приоритет
+      if (strcmp(nets.net[0].ssid, autoSsid.c_str()) != 0) {
+        strncpy(nets.net[0].ssid, autoSsid.c_str(), NET_SSID_LEN - 1);
+        nets.net[0].ssid[NET_SSID_LEN - 1] = 0;
+        nets.net[0].pass[0] = 0;
+        if (nets.count < 1) nets.count = 1;
+        netDirty = true;              // сохранит вызывающий код
+        Serial.println("сеть адаптера запомнена в слот 1");
+      }
+      return 0;
+    }
+    Serial.println("авто-адаптер не подключился, идём по списку");
+  }
+
   if (pick < 0) { Serial.println("ни одна известная сеть не видна"); return -1; }
 
   const NetEntry& e = nets.net[pick];

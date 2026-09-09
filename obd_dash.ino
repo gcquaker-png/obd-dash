@@ -815,24 +815,30 @@ void connectWiFi(bool forcePortal) {
     if (haveAny) {
       if (netConnectBest() < 0)
         Serial.println("известных сетей нет в эфире — ретрай в фоне");
+      if (netDirty) { netSave(prefs); netDirty = false; }
     } else {
-      // список ещё не заполнен (первый запуск после обновления) —
-      // используем сеть из WiFiManager и запоминаем её как OBD-сеть
-      WiFi.begin();
-      Serial.print("WiFi connecting");
-      uint32_t t0 = millis();
-      while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) {
-        delay(200); Serial.print(".");
-      }
-      Serial.println();
-      if (WiFi.status() == WL_CONNECTED) {
-        Serial.printf("WiFi OK  SSID=%s  IP=%s\n",
-                      WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
-        netSet(prefs, 0, WiFi.SSID().c_str(), WiFi.psk().c_str());
-        netActive = 0; netIsObd = true;
-        Serial.println("сеть запомнена как OBD (slot 0)");
+      // Список пуст (первый запуск после обновления). Сначала пробуем
+      // автоопределение адаптера по эфиру, затем — последнюю сеть из
+      // памяти WiFiManager.
+      if (netConnectBest() >= 0) {
+        if (netDirty) { netSave(prefs); netDirty = false; }
       } else {
-        Serial.println("WiFi not connected — работаем без сети, ретрай в фоне");
+        WiFi.begin();
+        Serial.print("WiFi connecting");
+        uint32_t t0 = millis();
+        while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) {
+          delay(200); Serial.print(".");
+        }
+        Serial.println();
+        if (WiFi.status() == WL_CONNECTED) {
+          Serial.printf("WiFi OK  SSID=%s  IP=%s\n",
+                        WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+          netSet(prefs, 0, WiFi.SSID().c_str(), WiFi.psk().c_str());
+          netActive = 0; netIsObd = true;
+          Serial.println("сеть запомнена как OBD (slot 1)");
+        } else {
+          Serial.println("WiFi not connected — работаем без сети, ретрай в фоне");
+        }
       }
     }
     Serial.printf("OBD target %s:%u\n", host.c_str(), port);
@@ -913,6 +919,7 @@ void elmService() {
         // адаптера может появиться позже домашней (или наоборот).
         Serial.println("WiFi lost, reconnecting");
         if (netConnectBest(6000) < 0) WiFi.reconnect();
+        else if (netDirty) { netSave(prefs); netDirty = false; }
         tRetry = millis();
         elmState = ELM_DISCONNECTED;
       }
