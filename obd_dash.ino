@@ -127,6 +127,11 @@ WebServer web(80);
 
 volatile bool dirtyFull = true;   // требуется полная перерисовка экрана (ISR/веб)
 
+// Собственная точка доступа: поднимается ТОЛЬКО в режиме настройки
+// (долгое удержание кнопки). Пароль — чтобы никто посторонний не влез.
+char apSsidGlobal[32] = "";
+#define AP_PASS "obddash1"
+
 // ============================================================
 // СОСТОЯНИЕ OBD
 // ============================================================
@@ -516,8 +521,11 @@ String webPage() {
     else        h += "<b>" + String(i + 1) + ". запасная</b><br>";
     h += "<input name=s" + String(i) + " placeholder='SSID' value='" +
          String(nets.net[i].ssid) + "' style='width:45%'> ";
-    h += "<input name=p" + String(i) + " placeholder='пароль' value='" +
-         String(nets.net[i].pass) + "' style='width:45%'>";
+    // Пароль не подставляем в поле — не светим его в HTML.
+    // Пусто = оставить прежний, ввод = заменить.
+    h += "<input name=p" + String(i) + " type=password style='width:45%' placeholder='";
+    h += nets.net[i].pass[0] ? "пароль сохранён" : "пароль";
+    h += "'>";
     h += "</div>";
   }
   h += F("<button type=submit>Сохранить сети</button></form>");
@@ -612,8 +620,14 @@ void webBegin() {
       if (web.hasArg(ks)) {
         String ss = web.arg(ks), pp = web.hasArg(kp) ? web.arg(kp) : "";
         ss.trim();
-        if (ss.length()) netSet(prefs, i, ss.c_str(), pp.c_str());
-        else if (i > 0)  netClear(prefs, i);
+        if (ss.length()) {
+          // пустое поле пароля = оставить сохранённый (его не показываем).
+          // Копируем в буфер: netSet пишет в ту же структуру, откуда читаем.
+          char keep[NET_PASS_LEN];
+          strncpy(keep, nets.net[i].pass, sizeof(keep) - 1);
+          keep[sizeof(keep) - 1] = 0;
+          netSet(prefs, i, ss.c_str(), pp.length() ? pp.c_str() : keep);
+        } else if (i > 0) netClear(prefs, i);
       }
     }
     web.send(200, "text/html; charset=utf-8",
@@ -1493,9 +1507,7 @@ void btnBegin() {
 // AP стабильно на канале 1.
 void enterSetupMode() {
   Serial.println("=== SETUP MODE (hold) ===");
-  uint64_t cid = ESP.getEfuseMac();
-  char ssid[32];
-  snprintf(ssid, sizeof(ssid), "OBD-Dash-%04X", (uint16_t)(cid & 0xFFFF));
+  const char* ssid = apSsidGlobal;
 
   elm.stop();
   elmState = ELM_DISCONNECTED;
@@ -1503,7 +1515,7 @@ void enterSetupMode() {
   WiFi.disconnect(true, false);        // рвём STA, настройки сети сохраняем
   WiFi.mode(WIFI_AP);
   WiFi.setSleep(false);
-  bool apok = WiFi.softAP(ssid, nullptr, 1);
+  bool apok = WiFi.softAP(ssid, AP_PASS, 1);   // закрытая сеть
   IPAddress ip = WiFi.softAPIP();
   Serial.printf("SETUP AP: %s ch1 %s  http://%s/\n",
                 ssid, apok ? "OK" : "FAIL", ip.toString().c_str());
@@ -1517,12 +1529,12 @@ void enterSetupMode() {
   lcd.setTextColor(TFT_WHITE);
   lcd.drawString("WiFi:", CX, CY - 8);
   lcd.setTextColor(TFT_CYAN);
-  lcd.drawString(ssid, CX, CY + 10);
+  lcd.drawString(ssid, CX, CY + 8);
   lcd.setTextColor(TFT_WHITE);
-  lcd.drawString(String("http://") + ip.toString() + "/", CX, CY + 32);
+  lcd.drawString(String("pass: ") + AP_PASS, CX, CY + 26);
+  lcd.drawString(String("http://") + ip.toString() + "/", CX, CY + 44);
   lcd.setTextColor(TFT_DARKGREY);
-  lcd.drawString("open / OTA -> /ota", CX, CY + 54);
-  lcd.drawString("hold btn to exit", CX, CY + 72);
+  lcd.drawString("hold btn to exit", CX, CY + 66);
 
   btnHoldQueue = 0;                    // сбросить событие входа
   btnQueue = 0;
@@ -1545,13 +1557,13 @@ void enterSetupMode() {
   lcd.setTextSize(1);
   lcd.drawString("reconnecting...", CX, CY);
 
-  WiFi.mode(WIFI_AP_STA);
+  // AP гасим: в рабочем режиме она не нужна и мешает опросу адаптера
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
-  WiFi.softAP(ssid, nullptr, 1);       // своя AP обратно на канал 1
-  WiFi.begin();                        // STA к сохранённой сети адаптера
-  uint32_t tw = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - tw < 8000) delay(100);
-  Serial.printf("STA %s\n", WiFi.status() == WL_CONNECTED ? "OK" : "not yet (retry in bg)");
+  if (netConnectBest() < 0) {          // по приоритету: сперва сеть OBD
+    Serial.println("сеть не найдена — ретрай в фоне");
+  }
 
   elmState = ELM_DISCONNECTED;         // elmService переподключится сам
   btnQueue = 0; btnHoldQueue = 0;
@@ -1619,17 +1631,15 @@ void setup() {
   dlogLoad(prefs);            // лог замеров (переживает перезагрузки)
   netLoad(prefs);             // список WiFi-сетей с приоритетом
 
-  // --- СНАЧАЛА поднимаем свою AP (фикс. канал 1), потом STA к адаптеру ---
-  // Так AP не «прыгает» за каналом STA и телефон её видит.
+  // Своя точка доступа в обычной работе НЕ поднимается: у ESP32-C3 одно
+  // радио на AP и STA, и AP отбирает эфирное время у опроса адаптера.
+  // Она нужна только для настройки — включается в setup-режиме
+  // (долгое удержание кнопки).
   uint64_t cid = ESP.getEfuseMac();
-  char apSsid[32];
-  snprintf(apSsid, sizeof(apSsid), "OBD-Dash-%04X", (uint16_t)(cid & 0xFFFF));
-  WiFi.mode(WIFI_AP_STA);
-  WiFi.setSleep(false);                            // sleep ломает видимость AP
-  bool apok = WiFi.softAP(apSsid, nullptr, 1);     // открытая, канал 1
-  Serial.printf("Config AP: %s ch1 %s  http://%s/\n",
-                apSsid, apok ? "OK" : "FAIL",
-                WiFi.softAPIP().toString().c_str());
+  snprintf(apSsidGlobal, sizeof(apSsidGlobal), "OBD-Dash-%04X", (uint16_t)(cid & 0xFFFF));
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  Serial.printf("AP выключена (настройка: удержать кнопку). SSID=%s\n", apSsidGlobal);
 
   connectWiFi(forcePortal);     // подключение к сети адаптера (STA)
 
@@ -1653,8 +1663,22 @@ void loop() {
 
   handleButton();
 
-  // --- ЛОГ ЗАМЕРОВ: закрыть слот раз в 10 с и сохранить в NVS ---
+  // --- ЛОГ ЗАМЕРОВ: закрыть слот и сохранить в NVS ---
   if (dlogTick()) dlogSave(prefs);
+
+  // Состояние радио в лог: поднята ли своя AP и сколько на ней клиентов.
+  // Нужно, чтобы по логу проверить, мешает ли AP опросу адаптера
+  // (у ESP32-C3 одно радио на AP и STA).
+  {
+    static uint32_t tRadio = 0;
+    if (millis() - tRadio >= 1000) {
+      tRadio = millis();
+      wifi_mode_t m = WiFi.getMode();
+      bool apUp = (m == WIFI_AP || m == WIFI_AP_STA);
+      dlogRadio(apUp, apUp ? WiFi.softAPgetStationNum() : 0, WiFi.RSSI());
+    }
+  }
+
 
   // Дома по USB: отправить 'L' в Serial -> дамп лога, 'C' -> очистить.
   if (Serial.available()) {
@@ -1739,10 +1763,10 @@ void loop() {
         pollSpeed();
       }
       if (millis() - tSlow >= 1200) { tSlow = millis(); pollSlowStep(); }
-      // Фоновое чтение кодов раз в 60 с — только чтобы знать, зажигать ли
+      // Фоновое чтение кодов раз в 10 минут — только чтобы знать, зажигать ли
       // значок (!) на главном. Запрос "03" небыстрый, потому так редко.
       static uint32_t tDtcBg = 0;
-      if (millis() - tDtcBg >= 60000) { tDtcBg = millis(); pollDtc(); }
+      if (millis() - tDtcBg >= 600000) { tDtcBg = millis(); pollDtc(); }
       if (gearUpdate(obd.rpm, obd.speed, obd.throttle)) gearSave(prefs);
       if (accelUpdate(obd.speed)) accelSave(prefs);
       drawGaugeValues();

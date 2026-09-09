@@ -31,7 +31,9 @@ struct LogSlot {
   uint16_t rttMax;
   uint16_t rpmMax;     // максимум RPM за слот (виден ли отклик на газ)
   uint8_t  spdMax;     // максимум скорости
-  uint8_t  flags;      // bit0 = была потеря линка за слот
+  uint8_t  flags;      // bit0 = потеря линка, bit1 = своя AP была поднята
+  uint8_t  apClients;  // сколько клиентов висело на нашей точке доступа
+  int8_t   rssi;       // уровень сигнала сети адаптера, dBm
 };
 
 // ---- виды аномалий для журнала ----
@@ -53,6 +55,7 @@ struct DriveLog {
   uint8_t  head;                  // индекс следующего слота (кольцо)
   uint8_t  boots;                 // счётчик запусков платы
   char     badResp[40];           // образец нераспознанного ответа адаптера
+  char     badResp2[40];          // ВТОРОЙ образец, из середины поездки
   uint8_t  suffixOff;             // 1 = адаптер не понял суффикс кадров
   uint8_t  evCount;               // сколько аномалий в журнале
   LogEvent ev[EV_MAX];            // журнал аномалий
@@ -70,6 +73,8 @@ static uint16_t dlRpmMax = 0;
 static uint8_t  dlSpdMax = 0;
 static uint8_t  dlFlags  = 0;
 static bool     dlDirty  = false;
+static uint8_t  dlApCli  = 0;     // максимум клиентов на нашей AP за слот
+static int8_t   dlRssi   = 0;     // последний RSSI сети адаптера
 
 inline void dlogLoad(Preferences& p) {
   p.begin("obd", true);
@@ -111,6 +116,16 @@ inline void dlogPoll(uint16_t rtt, int rpm, int spd) {
 // (NO DATA / ошибка протокола). Лечится это по-разному, потому и считаем врозь.
 inline void dlogFail(bool timeout) { dlFails++; if (timeout) dlTouts++; }
 
+// Состояние радио на момент слота — чтобы проверить гипотезу «своя точка
+// доступа отъедает эфир у связи с адаптером» (у ESP32-C3 одно радио).
+// apUp — поднята ли наша AP, clients — сколько клиентов на ней висит,
+// rssi — уровень сигнала сети адаптера.
+inline void dlogRadio(bool apUp, uint8_t clients, int rssi) {
+  if (apUp) dlFlags |= 0x02;
+  if (clients > dlApCli) dlApCli = clients;
+  if (rssi < 0 && rssi > -128) dlRssi = (int8_t)rssi;
+}
+
 // Запомнить образец нераспознанного ответа — чтобы дома понять, что
 // именно шлёт адаптер вместо данных (NO DATA, мусор, чужой PID...).
 // Пишем только первый за сессию: важен характер, а не количество.
@@ -151,11 +166,21 @@ inline const char* dlogEventName(uint8_t k) {
   }
 }
 
+// Два образца: первый (обычно при инициализации) и «поздний» — снятый
+// после 3 минут работы. Первый часто ловит стартовый мусор и заслоняет
+// то, что реально происходит в поездке.
 inline void dlogBadResp(const char* s) {
-  if (dlog.badResp[0]) return;                 // уже есть образец
-  strncpy(dlog.badResp, s, sizeof(dlog.badResp) - 1);
-  dlog.badResp[sizeof(dlog.badResp) - 1] = 0;
-  dlDirty = true;
+  if (!dlog.badResp[0]) {
+    strncpy(dlog.badResp, s, sizeof(dlog.badResp) - 1);
+    dlog.badResp[sizeof(dlog.badResp) - 1] = 0;
+    dlDirty = true;
+    return;
+  }
+  if (!dlog.badResp2[0] && millis() > 180000) {
+    strncpy(dlog.badResp2, s, sizeof(dlog.badResp2) - 1);
+    dlog.badResp2[sizeof(dlog.badResp2) - 1] = 0;
+    dlDirty = true;
+  }
 }
 inline void dlogLinkLost()  { dlFlags |= 0x01; }
 
@@ -175,6 +200,8 @@ inline bool dlogTick() {
   s.rpmMax = dlRpmMax;
   s.spdMax = dlSpdMax;
   s.flags  = dlFlags;
+  s.apClients = dlApCli;
+  s.rssi   = dlRssi;
 
   dlog.head = (dlog.head + 1) % LOG_SLOTS;
   if (dlog.count < LOG_SLOTS) dlog.count++;
@@ -182,7 +209,7 @@ inline bool dlogTick() {
   dlSlotStart = millis();
   dlPolls = dlFails = dlTouts = dlRttSum = 0;
   dlRttMin = 0xFFFF; dlRttMax = 0;
-  dlRpmMax = 0; dlSpdMax = 0; dlFlags = 0;
+  dlRpmMax = 0; dlSpdMax = 0; dlFlags = 0; dlApCli = 0;
   dlDirty = true;
   return true;
 }
@@ -192,16 +219,18 @@ inline void dlogDump() {
   Serial.println();
   Serial.println("===== DRIVE LOG BEGIN =====");
   Serial.printf("boots=%u slots=%u\n", dlog.boots, dlog.count);
-  Serial.printf("bad_resp_sample=[%s] suffix_off=%u\n",
-                dlog.badResp[0] ? dlog.badResp : "-", dlog.suffixOff);
-  Serial.println("sec\thz\tfails\ttouts\trtt_avg\trtt_min\trtt_max\trpm_max\tspd_max\tlink_lost");
+  Serial.printf("bad1=[%s]\nbad2=[%s]\nsuffix_off=%u\n",
+                dlog.badResp[0]  ? dlog.badResp  : "-",
+                dlog.badResp2[0] ? dlog.badResp2 : "-", dlog.suffixOff);
+  Serial.println("sec\thz\tfails\ttouts\trtt_avg\trtt_min\trtt_max\trpm_max\tspd_max\tlink\tap\tapcli\trssi");
   int start = (dlog.count < LOG_SLOTS) ? 0 : dlog.head;
   for (int i = 0; i < dlog.count; i++) {
     const LogSlot& s = dlog.slot[(start + i) % LOG_SLOTS];
-    Serial.printf("%u\t%.1f\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\n",
+    Serial.printf("%u\t%.1f\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%d\n",
                   s.sec, s.polls / 10.0f, s.fails, s.touts,
                   s.rttAvg, s.rttMin, s.rttMax,
-                  s.rpmMax, s.spdMax, (s.flags & 1) ? 1 : 0);
+                  s.rpmMax, s.spdMax, (s.flags & 1) ? 1 : 0,
+                  (s.flags & 2) ? 1 : 0, s.apClients, s.rssi);
   }
   Serial.printf("--- аномалии (%u) ---\n", dlog.evCount);
   for (int i = 0; i < dlog.evCount; i++) {
