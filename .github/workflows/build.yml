@@ -37,8 +37,11 @@ jobs:
       - name: Compile
         run: |
           mkdir -p out
+          VER="${GITHUB_SHA::7}"
+          echo "firmware version: $VER"
           arduino-cli compile \
             --fqbn "esp32:esp32:esp32c3:CDCOnBoot=cdc,PartitionScheme=min_spiffs,FlashMode=dio,FlashFreq=80,FlashSize=4M,UploadSpeed=921600,CPUFreq=160" \
+            --build-property "compiler.cpp.extra_flags=-DFW_VERSION=\"$VER\"" \
             --output-dir out \
             sketch/obd_dash
 

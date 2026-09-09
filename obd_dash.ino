@@ -11,6 +11,7 @@
 // URL прошивки для обновления «по воздуху» одной кнопкой.
 // GitHub Actions собирает и кладёт firmware.bin в релиз 'latest' при каждом пуше.
 #define FW_URL "https://github.com/gcquaker-png/obd-dash/releases/latest/download/firmware.bin"
+#include "version.h"
 #include "dtc_db.h"
 #include "pids.h"
 #include "gear.h"
@@ -405,7 +406,9 @@ String webPage() {
                "h1{font-size:18px}label{display:block;padding:6px 0;border-bottom:1px solid #333}"
                "input{transform:scale(1.4);margin-right:12px}"
                "button{margin-top:16px;padding:10px 24px;font-size:16px;background:#2a7;color:#fff;border:0;border-radius:6px}"
-               "</style><h1>OBD Dash — параметры экрана</h1><form method=POST action=/save>");
+               "</style><h1>OBD Dash</h1>");
+  h += String("<p style=color:#888;margin-top:-8px>прошивка: <b>") + FW_VERSION + " / " + FW_BUILD_DATE + "</b></p>";
+  h += F("<h1 style=font-size:17px>Параметры экрана</h1><form method=POST action=/save>");
   for (int i = 0; i < PID_DEFS_LEN; i++) {
     bool on = pidMask & (1u << i);
     h += "<label><input type=checkbox name=p" + String(i) + (on ? " checked>" : ">");
@@ -951,7 +954,7 @@ void drawParamsStatic() {
   lcd.setTextDatum(middle_center);
   lcd.setTextColor(TFT_LIGHTGREY);
   lcd.setTextSize(1);
-  lcd.drawString("PARAMS", 120, 26);
+  lcd.drawString(String("PARAMS  v") + FW_VERSION, 120, 26);
   // адреса веб-морды: своя точка "OBD-Dash-XXXX" -> 192.168.4.1
   lcd.setTextColor(TFT_DARKGREY);
   lcd.drawString("AP: 192.168.4.1", 120, 216);
@@ -1240,9 +1243,12 @@ void setup() {
   lcd.setTextDatum(middle_center);
   lcd.setTextColor(TFT_WHITE);
   lcd.setTextSize(2);
-  lcd.drawString("OBD Dash", 120, 100);
+  lcd.drawString("OBD Dash", 120, 96);
   lcd.setTextSize(1);
-  lcd.drawString("starting...", 120, 125);
+  lcd.setTextColor(TFT_DARKGREY);
+  lcd.drawString(String("v ") + FW_VERSION, 120, 120);
+  lcd.setTextColor(TFT_WHITE);
+  lcd.drawString("starting...", 120, 140);
   delay(300);
 
   // держишь кнопку при включении ~1.5 c -> портал
