@@ -1247,9 +1247,10 @@ void drawGaugeStatic() {
   tachReset();               // дуга нарисуется заново при первом drawTach
   // цифры шкалы убраны: сегменты по 250 об/мин с зазорами уже дают деление,
   // а числа по краю круга задевались сегментами и рябили.
-  label(120, 44, "RPM x1000");
-  label(78,  137, "km/h");
-  label(164, 137, "GEAR");
+  // Подпись RPM убрана — число оборотов теперь внизу, под ним место
+  // освободилось, а дуга сама себя объясняет.
+  label(78,  114, "km/h");
+  label(164, 114, "GEAR");
   // статус связи и значок ошибок рисует drawGaugeIcons() —
   // они меняются на ходу, поэтому не в статике
 }
@@ -1275,24 +1276,24 @@ static void drawGaugeIcons() {
 
   if (link != lastLink) {
     lastLink = link;
-    lcd.fillRect(60, 204, 84, 20, TFT_BLACK);
+    lcd.fillRect(76, 34, 58, 18, TFT_BLACK);
     lcd.setTextDatum(middle_center);
     lcd.setTextSize(1);
-    if (link == 2)      { lcd.setTextColor(TFT_GREEN);    lcd.drawString("OBD",  102, 214); }
-    else if (link == 1) { lcd.setTextColor(TFT_CYAN);     lcd.drawString("WIFI", 102, 214); }
-    else                { lcd.setTextColor(TFT_DARKGREY); lcd.drawString("--",   102, 214); }
+    if (link == 2)      { lcd.setTextColor(TFT_GREEN);    lcd.drawString("OBD",  105, 43); }
+    else if (link == 1) { lcd.setTextColor(TFT_CYAN);     lcd.drawString("WIFI", 105, 43); }
+    else                { lcd.setTextColor(TFT_DARKGREY); lcd.drawString("--",   105, 43); }
   }
 
   if (err != lastErr) {
     lastErr = err;
-    lcd.fillRect(146, 202, 24, 24, TFT_BLACK);
+    lcd.fillRect(142, 34, 22, 20, TFT_BLACK);
     if (err) {                                  // (!) — есть коды ошибок
-      lcd.drawCircle(157, 214, 9, TFT_RED);
-      lcd.drawFastVLine(157, 209, 6, TFT_RED);
-      lcd.drawPixel(157, 218, TFT_RED);
-      lcd.drawPixel(158, 209, TFT_RED);         // чуть жирнее ствол
-      lcd.drawFastVLine(158, 209, 6, TFT_RED);
-      lcd.drawPixel(158, 218, TFT_RED);
+      lcd.drawCircle(152, 43, 8, TFT_RED);
+      lcd.drawFastVLine(152, 38, 6, TFT_RED);
+      lcd.drawPixel(152, 47, TFT_RED);
+      lcd.drawPixel(153, 38, TFT_RED);         // чуть жирнее ствол
+      lcd.drawFastVLine(153, 38, 6, TFT_RED);
+      lcd.drawPixel(153, 47, TFT_RED);
     }
   }
 }
@@ -1305,12 +1306,12 @@ void drawGaugeValues() {
   drawTach(obd.rpm);
   if (obd.rpm >= 0) snprintf(b, sizeof(b), "%4d", obd.rpm);
   else              snprintf(b, sizeof(b), "----");
-  fieldId(0, 60, 58, 120, 28, b, TFT_WHITE, 3);
+  fieldId(0, 60, 166, 120, 28, b, TFT_WHITE, 3);
 
   // --- скорость (слева, фикс. ширина 3) ---
   if (obd.speed >= 0) snprintf(b, sizeof(b), "%3d", obd.speed);
   else                snprintf(b, sizeof(b), "  -");
-  fieldId(1, 38, 98, 80, 34, b, TFT_CYAN, 4);
+  fieldId(1, 38, 74, 80, 34, b, TFT_CYAN, 4);
 
   // --- передача (справа) ---
   String g; uint16_t gcol;
@@ -1318,15 +1319,18 @@ void drawGaugeValues() {
   else if (gearCalibrating)   { g = "c"; gcol = TFT_ORANGE; }
   else if (gears.count == 0)  { g = "-"; gcol = TFT_DARKGREY; }
   else                        { g = "N"; gcol = TFT_DARKGREY; }
-  fieldId(2, 124, 98, 80, 34, g, gcol, 4);
+  fieldId(2, 122, 74, 80, 34, g, gcol, 4);
 
   // --- температура ОЖ (слева): >95 красным крупнее, иначе зелёным ---
   bool overheat = (obd.coolant > 95);
   uint16_t tcol = (obd.coolant <= -200) ? TFT_DARKGREY
                 : overheat ? TFT_RED : TFT_GREEN;
-  if (obd.coolant > -200) snprintf(b, sizeof(b), "%dC", obd.coolant);
-  else                    snprintf(b, sizeof(b), "--C");
-  fieldId(3, 24, 150, 96, 30, b, tcol, overheat ? 4 : 3);
+  if (obd.coolant > -200) snprintf(b, sizeof(b), "%d", obd.coolant);
+  else                    snprintf(b, sizeof(b), "--");
+  // Число крупно, единица мелко: "120 C" целиком крупным шрифтом в круг
+  // не влезает (90 px при доступных 88), а ужимать цифры не хочется.
+  fieldId(3, 30, 128, 72, 28, b, tcol, 3);
+  fieldId(14, 102, 136, 16, 16, "C", tcol, 1);
 
   // --- напряжение АКБ (справа) ---
   uint16_t vcol = TFT_WHITE;
@@ -1335,9 +1339,9 @@ void drawGaugeValues() {
     else if (obd.voltage < 12.2) vcol = TFT_YELLOW;
     else vcol = TFT_GREEN;
     dtostrf(obd.voltage, 0, 1, b);
-    strcat(b, "V");
-  } else { strcpy(b, "--V"); vcol = TFT_DARKGREY; }
-  fieldId(4, 118, 150, 94, 30, b, vcol, 3);
+  } else { strcpy(b, "--"); vcol = TFT_DARKGREY; }
+  fieldId(4, 118, 128, 76, 28, b, vcol, 3);
+  fieldId(15, 194, 136, 16, 16, "V", vcol, 1);
 
   drawGaugeIcons();          // связь (OBD/WIFI) + значок ошибок
 }
