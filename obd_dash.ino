@@ -303,13 +303,33 @@ int parsePid(const String& resp, uint8_t expectMode, uint8_t expectPid, uint8_t*
   return 0;
 }
 
+// Медленный опрос (температура, нагрузка, дроссель, весь экран PARAMS).
+// ЭБУ примерно на каждый пятый запрос отвечает "занят" (7F 01 78). В быстром
+// queryFast01 повтор на этот случай есть, а здесь его не было: параметр
+// опрашивается редко (раз в несколько секунд), MISS_LIMIT промахов подряд
+// набирались легко — и температура с параметрами гасли в "--".
 bool queryPid01(uint8_t pid, uint8_t* out, int maxOut, int& cnt) {
   char cmd[8];
   snprintf(cmd, sizeof(cmd), "01%02X", pid);
-  String r = elmCmd(cmd, 800);
-  if (r.isEmpty()) return false;
-  cnt = parsePid(r, 0x01, pid, out, maxOut);
-  return cnt > 0;
+  for (int attempt = 0; attempt < 3; attempt++) {
+    if (attempt) delay(8);
+    String r = elmCmd(cmd, 800);
+    if (screenChanged) return false;
+    if (r.isEmpty()) return false;
+    cnt = parsePid(r, 0x01, pid, out, maxOut);
+    if (cnt > 0) return true;
+    if (!lastWasPending) {               // настоящий отказ — повтор не поможет
+      dlogBadResp(r.c_str());            // образец в журнал: переживёт поездку
+      static uint32_t tBadSlow = 0;
+      if (millis() - tBadSlow >= 2000) {
+        tBadSlow = millis();
+        Serial.printf("SLOW BAD pid=%02X: [%s]\n", pid, r.c_str());
+      }
+      return false;
+    }
+  }
+  dlogFailPending();
+  return false;
 }
 
 // БЫСТРЫЙ опрос одного PID (mode 01) — для RPM и скорости на GAUGE.
