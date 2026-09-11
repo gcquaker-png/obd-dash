@@ -1870,6 +1870,11 @@ void setup() {
   bool disp = lcd.init();
   Serial.printf("lcd.init() -> %d\n", disp);
   lcd.setRotation(2);   // экран перевёрнут на 180°
+  // Без cp437 LovyanGFX повторяет «классическое» поведение Adafruit-шрифта:
+  // любой код >= 176 сдвигается на +1 (lgfx_fonts.cpp: "Handle 'classic'
+  // charset behavior"). Наш знак градуса 0xF8 (248) рисовался бы глифом 249 —
+  // мелкой точкой, из-за чего температура на главном выглядела как пустая.
+  lcd.setAttribute(cp437_switch, true);
   brightLoad(prefs);
   brightBegin();        // перехватить пин подсветки ПОСЛЕ инициализации LCD
   brightApply();
