@@ -1250,8 +1250,6 @@ void drawGaugeStatic() {
   label(120, 44, "RPM x1000");
   label(78,  137, "km/h");
   label(164, 137, "GEAR");
-  label(78,  185, "TEMP");
-  label(164, 185, "BATT");
   // статус связи и значок ошибок рисует drawGaugeIcons() —
   // они меняются на ходу, поэтому не в статике
 }
@@ -1326,9 +1324,9 @@ void drawGaugeValues() {
   bool overheat = (obd.coolant > 95);
   uint16_t tcol = (obd.coolant <= -200) ? TFT_DARKGREY
                 : overheat ? TFT_RED : TFT_GREEN;
-  if (obd.coolant > -200) snprintf(b, sizeof(b), "%d", obd.coolant);
-  else                    snprintf(b, sizeof(b), "--");
-  fieldId(3, 36, 150, 84, 30, b, tcol, overheat ? 4 : 3);
+  if (obd.coolant > -200) snprintf(b, sizeof(b), "%dC", obd.coolant);
+  else                    snprintf(b, sizeof(b), "--C");
+  fieldId(3, 24, 150, 96, 30, b, tcol, overheat ? 4 : 3);
 
   // --- напряжение АКБ (справа) ---
   uint16_t vcol = TFT_WHITE;
@@ -1337,8 +1335,9 @@ void drawGaugeValues() {
     else if (obd.voltage < 12.2) vcol = TFT_YELLOW;
     else vcol = TFT_GREEN;
     dtostrf(obd.voltage, 0, 1, b);
-  } else { strcpy(b, "--"); vcol = TFT_DARKGREY; }
-  fieldId(4, 120, 150, 84, 30, b, vcol, 3);
+    strcat(b, "V");
+  } else { strcpy(b, "--V"); vcol = TFT_DARKGREY; }
+  fieldId(4, 118, 150, 94, 30, b, vcol, 3);
 
   drawGaugeIcons();          // связь (OBD/WIFI) + значок ошибок
 }

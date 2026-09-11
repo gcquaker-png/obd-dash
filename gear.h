@@ -37,6 +37,11 @@ static GearTable gears = { {0}, 0, 5 };
 static int  gearCurrent = 0;          // 0 = не определена / нейтраль
 static bool gearCalibrating = false;  // идёт набор стабильного окна
 static bool gearLocked = false;       // калибровка завершена (набрано target)
+// Сколько держать последнюю передачу при пропаже данных, мс. Адаптер
+// отвечает ~13 Гц, одиночные промахи обычны — без удержания цифра мигает.
+#define GEAR_HOLD_MS 1500
+static uint32_t gearLostSince = 0;
+static uint32_t gearMatchLost = 0;
 
 // ---- NVS ----
 inline void gearRecalcLock() { gearLocked = (gears.count >= gears.target); }
@@ -100,11 +105,24 @@ inline bool gearUpdate(int rpm, int speed, int throttle) {
   static uint32_t winStart = 0;
   static int rMin, rMax, sMin, sMax;
 
-  gearCurrent = 0;
   gearCalibrating = false;
 
-  // нейтраль / накат / стоп — передачу не показываем
-  if (speed < GEAR_MIN_SPEED || rpm < GEAR_MIN_RPM) { winStart = 0; return false; }
+  // Данных нет (промах опроса даёт rpm/speed = -1) — НЕ трогаем показание:
+  // иначе на каждом пропущенном ответе передача мигала бы в «N».
+  // Держим прежнюю до GEAR_HOLD_MS, потом уже гасим.
+  if (rpm < 0 || speed < 0) {
+    if (gearLostSince == 0) gearLostSince = millis();
+    if (millis() - gearLostSince > GEAR_HOLD_MS) gearCurrent = 0;
+    winStart = 0;
+    return false;
+  }
+  gearLostSince = 0;
+
+  // нейтраль / накат / стоп — тут передача действительно не нужна,
+  // гасим сразу (это устойчивое состояние, а не пропажа данных)
+  if (speed < GEAR_MIN_SPEED || rpm < GEAR_MIN_RPM) {
+    gearCurrent = 0; gearMatchLost = 0; winStart = 0; return false;
+  }
 
   float r = (float)rpm / speed;
 
@@ -115,7 +133,18 @@ inline bool gearUpdate(int rpm, int speed, int throttle) {
       float d = fabsf(r - gears.ratio[i]) / gears.ratio[i];
       if (d < bestd) { bestd = d; best = i; }
     }
-    if (best >= 0 && bestd < GEAR_MATCH_TOL) gearCurrent = best + 1;
+    if (best >= 0 && bestd < GEAR_MATCH_TOL) {
+      gearCurrent = best + 1;
+      gearMatchLost = 0;
+    } else {
+      // Ни одна передача не подошла — это бывает в момент переключения
+      // и на рывках. Держим прежнюю, иначе цифра моргает на каждом
+      // неудачном замере.
+      if (gearMatchLost == 0) gearMatchLost = millis();
+      if (millis() - gearMatchLost > GEAR_HOLD_MS) gearCurrent = 0;
+    }
+  } else {
+    gearCurrent = 0;
   }
 
   // калибровка заморожена — дальше только определение
