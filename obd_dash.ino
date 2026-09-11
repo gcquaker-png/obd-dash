@@ -308,12 +308,43 @@ int parsePid(const String& resp, uint8_t expectMode, uint8_t expectPid, uint8_t*
 // queryFast01 повтор на этот случай есть, а здесь его не было: параметр
 // опрашивается редко (раз в несколько секунд), MISS_LIMIT промахов подряд
 // набирались легко — и температура с параметрами гасли в "--".
+// Потолок ожидания ЭБУ (ATST). В инициализации стоит 0x20 ~= 128 мс — этого
+// хватает быстрым PID (обороты, скорость), но температура/нагрузка/дроссель
+// на этом ЭБУ сперва отвечают "занят" (7F 01 78) и реальный ответ приходит
+// позже. ELM успевал сдаться и вернуть NO DATA до него, а повтор упирался
+// в тот же потолок. На время медленного запроса поднимаем до 0x60 ~= 384 мс.
+#define ELM_ST_FAST "20"
+#define ELM_ST_SLOW "60"
+static bool elmStSlow = false;
+static void elmSetSt(bool slow) {
+  if (slow == elmStSlow) return;
+  elmCmd(String("ATST") + (slow ? ELM_ST_SLOW : ELM_ST_FAST), 400);
+  elmStSlow = slow;
+}
+
+// Кольцо последних обменов по МЕДЛЕННЫМ PID — чтобы увидеть живьём, что
+// именно отвечает адаптер на 0105/0104/0111, без ноутбука в машине: /slow.
+#define SLOWDBG_N 12
+struct SlowDbg { uint8_t pid; uint16_t ms; char resp[40]; };
+static SlowDbg slowDbg[SLOWDBG_N];
+static uint8_t slowDbgHead = 0;
+static void slowDbgAdd(uint8_t pid, uint16_t ms, const char* r) {
+  SlowDbg& d = slowDbg[slowDbgHead];
+  d.pid = pid; d.ms = ms;
+  strncpy(d.resp, r ? r : "", sizeof(d.resp) - 1);
+  d.resp[sizeof(d.resp) - 1] = 0;
+  slowDbgHead = (slowDbgHead + 1) % SLOWDBG_N;
+}
+
 bool queryPid01(uint8_t pid, uint8_t* out, int maxOut, int& cnt) {
   char cmd[8];
   snprintf(cmd, sizeof(cmd), "01%02X", pid);
+  elmSetSt(true);                        // дать ЭБУ время ответить
   for (int attempt = 0; attempt < 3; attempt++) {
     if (attempt) delay(8);
-    String r = elmCmd(cmd, 800);
+    uint32_t tq = millis();
+    String r = elmCmd(cmd, 700);       // > потолка ATST 0x60 (~384 мс)
+    slowDbgAdd(pid, (uint16_t)(millis() - tq), r.c_str());
     if (screenChanged) return false;
     if (r.isEmpty()) return false;
     cnt = parsePid(r, 0x01, pid, out, maxOut);
@@ -359,6 +390,7 @@ bool queryFast01(uint8_t pid, uint8_t* out, int maxOut, int& cnt) {
   if (fastSuffixOk) snprintf(cmd, sizeof(cmd), "01%02X1", pid);
   else              snprintf(cmd, sizeof(cmd), "01%02X",  pid);
 
+  elmSetSt(false);                       // быстрым PID нужен низкий потолок
   uint32_t t0 = millis();
   String r = elmCmd(cmd, FAST_TIMEOUT_MS);
   lastRtt = (uint16_t)(millis() - t0);
@@ -718,6 +750,23 @@ void webBegin() {
              F("<meta http-equiv=refresh content='1;url=/'>Сохранено."));
   });
   // Лог замеров текстом: и с телефона в setup-режиме, и с компа по /log
+  // Живой срез медленного опроса: что реально отвечает адаптер на 0105 и т.д.
+  web.on("/slow", []() {
+    String s = "pid\tms\tresp\n";
+    s.reserve(1024);
+    for (int i = 0; i < SLOWDBG_N; i++) {
+      const SlowDbg& d = slowDbg[(slowDbgHead + i) % SLOWDBG_N];
+      if (!d.pid && !d.resp[0]) continue;
+      char line[80];
+      snprintf(line, sizeof(line), "%02X\t%u\t[%s]\n", d.pid, d.ms, d.resp);
+      s += line;
+    }
+    s += "\nATST slow="; s += (elmStSlow ? "yes" : "no");
+    s += "  coolant="; s += obd.coolant;
+    s += "  load="; s += obd.load;
+    s += "  thr="; s += obd.throttle;
+    web.send(200, "text/plain; charset=utf-8", s);
+  });
   web.on("/log", []() {
     String s = "sec\thz\tfails\ttouts\tpend\trtt_avg\trtt_min\trtt_max\trpm_max\tspd_max\tlink\n";
     s.reserve(2048);
@@ -1074,7 +1123,8 @@ void elmService() {
       elmCmd("ATS0", 400);   if (screenChanged) break;   // пробелы off
       elmCmd("ATH0", 400);   if (screenChanged) break;   // заголовки off
       elmCmd("ATAT1", 400);  if (screenChanged) break;   // адаптивный тайминг
-      elmCmd("ATST20", 400); if (screenChanged) break;   // потолок ожидания ЭБУ = 0x20*4 ≈ 128 мс (по умолч. ~200)
+      elmCmd("ATST" ELM_ST_FAST, 400); if (screenChanged) break;  // потолок ожидания ЭБУ ~128 мс
+      elmStSlow = false;     // ATZ сбросил настройки — кэш потолка тоже
       elmCmd("ATCAF1", 400); if (screenChanged) break;   // авто-формат CAN
       // жёстко ISO 15765 500k 11-bit (почти все машины 2008+) — без авто-детекта
       elmCmd("ATSP6", 400);  if (screenChanged) break;
