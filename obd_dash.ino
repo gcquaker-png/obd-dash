@@ -117,6 +117,21 @@ LGFX lcd;
 // ============================================================
 enum Screen { SCREEN_GAUGE, SCREEN_PARAMS, SCREEN_ACCEL, SCREEN_DTC };
 const int SCREEN_COUNT = 4;
+
+// Экран замера разгона показывается только по галочке в веб-морде:
+// в обычной езде он не нужен и мешает листать. Хранится в NVS.
+static bool accelScreenOn = false;
+static inline bool screenVisible(int s) {
+  return (s != SCREEN_ACCEL) || accelScreenOn;
+}
+// следующий видимый экран по кругу
+static inline Screen nextVisibleScreen(int from) {
+  for (int i = 1; i <= SCREEN_COUNT; i++) {
+    int c = (from + i) % SCREEN_COUNT;
+    if (screenVisible(c)) return (Screen)c;
+  }
+  return SCREEN_GAUGE;
+}
 volatile Screen currentScreen = SCREEN_GAUGE;   // меняется из ISR кнопки
 
 // выбранные для экрана PARAMS параметры (битовая маска по PID_DEFS)
@@ -134,23 +149,46 @@ volatile bool dirtyFull = true;   // требуется полная перер�
 // плате нет. Поэтому режим переключается вручную — коротким касанием
 // в режиме настройки, и запоминается в NVS.
 #define BRIGHT_DAY   255
-#define BRIGHT_NIGHT_DEF 45
+#define BRIGHT_NIGHT_DEF 38    // 15% от 255
 static bool    nightMode   = false;
 static uint8_t nightLevel  = BRIGHT_NIGHT_DEF;
 
-inline void brightApply() {
-  lcd.setBrightness(nightMode ? nightLevel : BRIGHT_DAY);
+// Яркость — собственным каналом LEDC на пине подсветки.
+// Проверено отдельным тестом на этой плате: setBrightness() (Light_PWM)
+// яркость НЕ меняет, а ledcWrite — меняет. Тонкость: привязывать пин к
+// своему каналу нужно ПОСЛЕ lcd.init(), иначе библиотека при инициализации
+// перехватывает пин обратно и ШИМ не действует.
+#define BL_PWM_CH   5
+#define BL_PWM_FREQ 5000
+#define BL_PWM_BITS 8
+static bool blPwmReady = false;
+
+// --- тела функций яркости: нужны после объявления lcd ---
+inline void brightBegin() {           // звать ОДИН раз, после lcd.init()
+  lcd.setBrightness(255);             // отпустить Light_PWM на максимум
+  ledcSetup(BL_PWM_CH, BL_PWM_FREQ, BL_PWM_BITS);
+  ledcAttachPin(TFT_BL, BL_PWM_CH);   // перехватываем пин своим каналом
+  blPwmReady = true;
 }
+inline void brightApply() {
+  if (!blPwmReady) return;            // до brightBegin пин ещё у библиотеки
+  ledcWrite(BL_PWM_CH, nightMode ? nightLevel : BRIGHT_DAY);
+}
+
 inline void brightLoad(Preferences& p) {
   p.begin("obd", true);
   nightMode  = p.getBool("night", false);
+  accelScreenOn = p.getBool("accelscr", false);
   nightLevel = p.getUChar("nightlv", BRIGHT_NIGHT_DEF);
-  if (nightLevel < 5) nightLevel = 5;
+  // Миграция: значения от прежних экспериментов (в т.ч. 230 «90%»)
+  // сбрасываем к текущему умолчанию 15%.
+  if (nightLevel < 10 || nightLevel > 200) nightLevel = BRIGHT_NIGHT_DEF;
   p.end();
 }
 inline void brightSave(Preferences& p) {
   p.begin("obd", false);
   p.putBool("night", nightMode);
+  p.putBool("accelscr", accelScreenOn);
   p.putUChar("nightlv", nightLevel);
   p.end();
 }
@@ -349,16 +387,6 @@ bool queryFast01(uint8_t pid, uint8_t* out, int maxOut, int& cnt) {
   return cnt > 0;
 }
 
-// Мультизапрос: одна команда "01 <p1><p2>..." -> один ответ со всеми PID.
-// ELM327 (и большинство клонов) поддерживают до 6 PID в запросе.
-// lastMultiOk = сработал ли мультирежим (иначе откат на поштучный опрос).
-static bool lastMultiOk = true;
-String queryMulti(const uint8_t* pids, int npid) {
-  char cmd[24] = "01";
-  for (int i = 0; i < npid && i < 6; i++)
-    sprintf(cmd + strlen(cmd), "%02X", pids[i]);
-  return elmCmd(cmd, 900);
-}
 
 // ============================================================
 // ОПРОС — мелкими быстрыми запросами (по одному PID)
@@ -719,6 +747,15 @@ void webBegin() {
              F("<meta http-equiv=refresh content='1;url=/'>OK"));
   });
 
+  web.on("/screens", HTTP_POST, []() {
+    accelScreenOn = web.hasArg("accel");
+    brightSave(prefs);                    // флаг лежит рядом с яркостью
+    // если сейчас на скрытом экране — уйти на главный
+    if (!screenVisible(currentScreen)) { currentScreen = SCREEN_GAUGE; dirtyFull = true; }
+    web.send(200, "text/html; charset=utf-8",
+             F("<meta http-equiv=refresh content='1;url=/'>OK"));
+  });
+
   web.on("/logclear", HTTP_POST, []() {
     dlogClear(prefs);
     web.send(200, "text/html; charset=utf-8",
@@ -1021,7 +1058,6 @@ void elmService() {
       elmCmd("ATCAF1", 400); if (screenChanged) break;   // авто-формат CAN
       // жёстко ISO 15765 500k 11-bit (почти все машины 2008+) — без авто-детекта
       elmCmd("ATSP6", 400);  if (screenChanged) break;
-      lastMultiOk = true;                                 // пробуем мультизапрос заново
       String r = elmCmd("0100", 1500);
       if (r.indexOf("41") >= 0 || r.indexOf("SEARCHING") >= 0) {
         Serial.println("ELM ready (SP6)");
@@ -1106,13 +1142,8 @@ static uint16_t tachColor(int rpm) {
 
 // Сегмент как сплошная трапеция: две пары треугольников + заливка щелей
 // дуговыми линиями. Без просветов на любом радиусе.
-// frac (0..1] — какая доля сегмента залита, для плавного «дорастания»
-// последнего деления. Именно это даёт видимую плавность: раньше
-// интерполировалось только значение, а рисовалось всё равно целыми
-// сегментами по 250 об/мин, поэтому между делениями картинка не менялась.
-static void tachDrawSegF(int seg, uint16_t col, float frac) {
-  if (frac <= 0.0f) return;
-  if (frac > 1.0f) frac = 1.0f;
+static void tachDrawSeg(int seg, uint16_t col) {
+  const float frac = 1.0f;
   float base = TACH_A_START + TACH_A_SPAN * seg / (float)TACH_NSEG;
   float full = TACH_A_SPAN / (float)TACH_NSEG;
   float a0 = base + TACH_GAP_DEG;
@@ -1135,7 +1166,6 @@ static void tachDrawSegF(int seg, uint16_t col, float frac) {
 }
 
 // целый сегмент — частый случай
-static void tachDrawSeg(int seg, uint16_t col) { tachDrawSegF(seg, col, 1.0f); }
 
 // СТИРАНИЕ сегмента — той же формой, что заливка, плюс небольшой запас
 // по углу и радиусу. Сегменты рисуются только целиком, поэтому геометрия
@@ -1163,16 +1193,11 @@ static void tachEraseSeg(int seg) {
   }
 }
 
-// ---- Плавная дуга -----------------------------------------------------
-// Что было не так в прошлой попытке:
-//  1) сглаживалось только ЗНАЧЕНИЕ, а рисовалось целыми сегментами по
-//     250 об/мин — между делениями картинка не менялась вовсе, дуга
-//     дёргалась так же, только с запозданием;
-//  2) drawTachAnim() рисовал дугу из одной ветки цикла, а drawGaugeValues()
-//     из другой звал drawTach(obd.rpm) с сырым значением — две функции
-//     спорили за одну дугу разными числами, отсюда «кривое» отображение.
-// Решение: ЕДИНСТВЕННАЯ точка отрисовки (tachRender), сглаженное значение
-// хранится в одном месте, а последний сегмент рисуется ДРОБНО.
+// ---- Плавная дуга ----------------------------------------------------
+// Значение сглаживается (tachTick), рисуется всегда целыми сегментами:
+// fillTriangle при разных углах даёт разный растр, поэтому частично
+// залитый сегмент нельзя стереть «в ноль» — оставались бы точки.
+// Единственная точка отрисовки — tachRender.
 
 
 // ---- ДЕЛЕНИЯ В ПОЛОСЕ ДУГИ ----------------------------------------
@@ -1272,16 +1297,22 @@ static void tachTick() {
 // изменились — иначе не трогает пиксели (нет мелькания при том же значении).
 // id — уникальный номер поля 0..FIELD_MAX-1.
 #define FIELD_MAX 16
-struct FieldCache { String s; uint16_t col; uint8_t size; bool init; };
+#define FIELD_TEXT_MAX 12
+// Буфер вместо String: fieldId зовётся 5 раз за кадр, а временный String
+// на каждый вызов — это выделение кучи в горячем пути отрисовки.
+struct FieldCache { char s[FIELD_TEXT_MAX]; uint16_t col; uint8_t size; bool init; };
 static FieldCache fcache[FIELD_MAX];
 
-static void fieldId(int id, int x, int y, int w, int h, const String& s,
+static void fieldId(int id, int x, int y, int w, int h, const char* s,
                     uint16_t col, uint8_t size) {
   FieldCache& c = fcache[id];
-  if (c.init && c.s == s && c.col == col && c.size == size) return;   // не изменилось
+  if (c.init && c.col == col && c.size == size && strcmp(c.s, s) == 0) return;
 
-  bool sameLayout = c.init && c.size == size && c.s.length() == s.length();
-  c.s = s; c.col = col; c.size = size; c.init = true;
+  size_t oldLen = c.init ? strlen(c.s) : 0;
+  bool sameLayout = c.init && c.size == size && oldLen == strlen(s);
+  strncpy(c.s, s, FIELD_TEXT_MAX - 1);
+  c.s[FIELD_TEXT_MAX - 1] = 0;
+  c.col = col; c.size = size; c.init = true;
 
   lcd.setTextDatum(middle_center);
   lcd.setTextSize(size);
@@ -1291,11 +1322,8 @@ static void fieldId(int id, int x, int y, int w, int h, const String& s,
     lcd.drawString(s, x + w / 2, y + h / 2);
   } else {
     // Длина или размер изменились — чистим зону и рисуем.
-    // Запас по вертикали обязателен: крупный шрифт (size 4 = ~32 px)
-    // выше зоны h=30, поэтому при возврате к меньшему размеру от него
-    // оставались верхушки букв (красные полоски над температурой).
-    // Запас только ВВЕРХ: снизу на y+h+5 уже стоят подписи (TEMP/BATT),
-    // их затирать нельзя. Крупный шрифт вылезает именно вверх.
+    // Запас вверх обязателен: крупный шрифт выше зоны и при возврате
+    // к меньшему размеру оставлял бы верхушки букв.
     lcd.fillRect(x, y - 7, w, h + 8, TFT_BLACK);
     lcd.setTextColor(col);
     lcd.drawString(s, x + w / 2, y + h / 2);
@@ -1396,11 +1424,11 @@ void drawGaugeValues() {
   fieldId(1, 60, 62, 64, 34, b, TFT_CYAN, 4);
 
   // --- передача (справа) ---
-  String g; uint16_t gcol;
-  if      (gearCurrent > 0)   { g = String(gearCurrent); gcol = TFT_WHITE; }
-  else if (gearCalibrating)   { g = "c"; gcol = TFT_ORANGE; }
-  else if (gears.count == 0)  { g = "-"; gcol = TFT_DARKGREY; }
-  else                        { g = "N"; gcol = TFT_DARKGREY; }
+  char g[4]; uint16_t gcol;
+  if      (gearCurrent > 0)   { g[0] = '0' + gearCurrent; g[1] = 0; gcol = TFT_WHITE; }
+  else if (gearCalibrating)   { strcpy(g, "c"); gcol = TFT_ORANGE; }
+  else if (gears.count == 0)  { strcpy(g, "-"); gcol = TFT_DARKGREY; }
+  else                        { strcpy(g, "N"); gcol = TFT_DARKGREY; }
   fieldId(2, 128, 62, 64, 34, g, gcol, 4);
 
   // --- температура ОЖ (слева): >95 красным крупнее, иначе зелёным ---
@@ -1472,7 +1500,7 @@ void drawParamsValues() {
     PidVal& v = pidVals[i];
     // значение с кэшем: id = 5 + k (0..4 занял GAUGE)
     fieldId(5 + k, cx - PCELL_W / 2, cy - 2, PCELL_W, 22,
-            v.valid ? v.text : String("--"),
+            v.valid ? v.text.c_str() : "--",
             v.valid ? v.color : C_GREY, 2);
   }
 }
@@ -1659,7 +1687,6 @@ void gotoScreen(Screen s) {
   if (s == SCREEN_DTC) dtcValid = false;    // перечитать коды при входе
 }
 
-void nextScreen() { gotoScreen((Screen)((currentScreen + 1) % SCREEN_COUNT)); }
 
 // ============================================================
 // КНОПКА (сенсорная TTP223, активна BTN_ACTIVE) — ПРИОРИТЕТНАЯ
@@ -1685,19 +1712,24 @@ void IRAM_ATTR btnTick() {
   static bool     armed  = true;
   static bool     holdFired = false;
 
+  // Короткое касание засчитываем по ОТПУСКАНИЮ: иначе долгое удержание
+  // сперва давало бы «тап», и выход из setup менял бы яркость заодно.
   if (btnRaw()) {
     lowMs = 0;
     if (highMs < 60000) highMs++;
-    if (armed && highMs >= BTN_HOLD_MS) {
+    if (!holdFired && highMs >= BTN_SETUP_MS) {
+      btnHoldQueue = 1;              // держим долго -> setup-режим
+      holdFired = true;
+      screenChanged = true;
+    }
+  } else {
+    // отпустили: если было короткое нажатие и оно не переросло в длинное —
+    // только теперь это «тап»
+    if (armed && highMs >= BTN_HOLD_MS && !holdFired) {
       btnQueue = 1;
       screenChanged = true;
       armed = false;
     }
-    if (!holdFired && highMs >= BTN_SETUP_MS) {
-      btnHoldQueue = 1;              // держим долго -> setup-режим
-      holdFired = true;
-    }
-  } else {
     highMs = 0;
     holdFired = false;
     if (lowMs < 60000) lowMs++;
@@ -1812,7 +1844,7 @@ void handleButton() {
   if (btnQueue == 0) return;
   btnQueue = 0;
   Serial.println("BTN tap -> next");
-  currentScreen = (Screen)((currentScreen + 1) % SCREEN_COUNT);
+  currentScreen = nextVisibleScreen(currentScreen);
   dirtyFull = true;
   if (currentScreen == SCREEN_DTC) dtcValid = false;
 }
@@ -1834,6 +1866,7 @@ void setup() {
   Serial.printf("lcd.init() -> %d\n", disp);
   lcd.setRotation(2);   // экран перевёрнут на 180°
   brightLoad(prefs);
+  brightBegin();        // перехватить пин подсветки ПОСЛЕ инициализации LCD
   brightApply();
 
   lcd.fillScreen(TFT_BLACK);
@@ -2029,9 +2062,8 @@ void loop() {
     } else if (!ready && millis() - tRedraw >= 300) {
       tRedraw = millis(); drawGaugeValues();
     }
-    // Сглаживание дуги — ВСЕГДА и в одном месте, независимо от того,
-    // был ли в этом проходе опрос. Раньше анимация жила в else-ветке и
-    // спорила с drawGaugeValues() за одну и ту же дугу — дуга «кривила».
+    // Сглаживание дуги — всегда и в одном месте, независимо от опроса:
+    // у дуги должен быть ровно один хозяин.
     static uint32_t tAnim = 0;
     if (millis() - tAnim >= 25) { tAnim = millis(); tachTick(); }
   }
