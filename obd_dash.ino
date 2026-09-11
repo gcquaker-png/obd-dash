@@ -127,6 +127,34 @@ WebServer web(80);
 
 volatile bool dirtyFull = true;   // требуется полная перерисовка экрана (ISR/веб)
 
+// ---- ЯРКОСТЬ ЭКРАНА ------------------------------------------------
+// Ночью полная яркость слепит. Автоопределения нет: габариты в
+// стандартном OBD-II не передаются (это кузовная шина, до неё через
+// диагностический разъём не добраться), а часов реального времени на
+// плате нет. Поэтому режим переключается вручную — коротким касанием
+// в режиме настройки, и запоминается в NVS.
+#define BRIGHT_DAY   255
+#define BRIGHT_NIGHT_DEF 45
+static bool    nightMode   = false;
+static uint8_t nightLevel  = BRIGHT_NIGHT_DEF;
+
+inline void brightApply() {
+  lcd.setBrightness(nightMode ? nightLevel : BRIGHT_DAY);
+}
+inline void brightLoad(Preferences& p) {
+  p.begin("obd", true);
+  nightMode  = p.getBool("night", false);
+  nightLevel = p.getUChar("nightlv", BRIGHT_NIGHT_DEF);
+  if (nightLevel < 5) nightLevel = 5;
+  p.end();
+}
+inline void brightSave(Preferences& p) {
+  p.begin("obd", false);
+  p.putBool("night", nightMode);
+  p.putUChar("nightlv", nightLevel);
+  p.end();
+}
+
 // Собственная точка доступа: поднимается ТОЛЬКО в режиме настройки
 // (долгое удержание кнопки). Пароль — чтобы никто посторонний не влез.
 char apSsidGlobal[32] = "";
@@ -539,6 +567,21 @@ String webPage() {
   }
   h += F("<button type=submit>Сохранить</button></form>");
 
+  // --- яркость экрана ---
+  h += F("<h1 style=margin-top:28px>Яркость</h1>"
+         "<form method=POST action=/bright>"
+         "<label><input type=radio name=n value=0");
+  h += nightMode ? F(">") : F(" checked>");
+  h += F("День (полная)</label>"
+         "<label><input type=radio name=n value=1");
+  h += nightMode ? F(" checked>") : F(">");
+  h += F("Ночь (приглушённая)</label>"
+         "<label>Уровень ночной, 5..255 <input name=lv type=number min=5 max=255 "
+         "style='width:80px' value='");
+  h += String(nightLevel) + F("'></label><button type=submit>Применить</button></form>"
+         "<p style=color:#888>Переключать можно и кнопкой: в режиме настройки "
+         "короткое касание меняет день/ночь.</p>");
+
   // --- WiFi-сети с приоритетом ---
   h += F("<h1 style=margin-top:28px>WiFi-сети</h1>"
          "<p style=color:#888>Слот 1 — сеть OBD-адаптера, у неё приоритет. "
@@ -662,6 +705,18 @@ void webBegin() {
     }
     web.send(200, "text/html; charset=utf-8",
              F("<meta http-equiv=refresh content='1;url=/'>Сети сохранены."));
+  });
+
+  web.on("/bright", HTTP_POST, []() {
+    if (web.hasArg("n")) nightMode = (web.arg("n") == "1");
+    if (web.hasArg("lv")) {
+      int v = web.arg("lv").toInt();
+      nightLevel = (v < 5) ? 5 : (v > 255 ? 255 : v);
+    }
+    brightApply();
+    brightSave(prefs);
+    web.send(200, "text/html; charset=utf-8",
+             F("<meta http-equiv=refresh content='1;url=/'>OK"));
   });
 
   web.on("/logclear", HTTP_POST, []() {
@@ -1119,6 +1174,33 @@ static void tachEraseSeg(int seg) {
 // Решение: ЕДИНСТВЕННАЯ точка отрисовки (tachRender), сглаженное значение
 // хранится в одном месте, а последний сегмент рисуется ДРОБНО.
 
+
+// ---- ДЕЛЕНИЯ В ПОЛОСЕ ДУГИ ----------------------------------------
+// Каждая круглая тысяча об/мин занимает свой сегмент: он НИКОГДА не
+// заливается, вместо него в полосе дуги стоит цифра. Так деления
+// читаются как на штатной приборке и не мешают ни полям, ни стиранию.
+// 1000 об/мин = 4 сегмента по 250, поэтому метки — это сегменты 0,4,8...
+#define TACH_LBL_STEP 4
+static inline bool tachIsLabelSeg(int seg) {
+  return (seg % TACH_LBL_STEP) == 0 && seg / TACH_LBL_STEP <= 7;
+}
+// Нарисовать цифру деления по центру её сегмента, в середине полосы дуги.
+static void tachDrawLabel(int seg) {
+  int k = seg / TACH_LBL_STEP;
+  float a = TACH_A_START + TACH_A_SPAN * (seg + 0.5f) / (float)TACH_NSEG;
+  float r = a * DEG_TO_RAD;
+  int rMid = (TACH_R_IN + TACH_R_OUT) / 2;
+  lcd.setTextDatum(middle_center);
+  lcd.setTextSize(1);
+  lcd.setTextColor(TFT_LIGHTGREY);
+  lcd.drawString(String(k), CX + cosf(r) * rMid, CY + sinf(r) * rMid);
+}
+// Перерисовать все деления — после любой правки дуги
+static void tachDrawAllLabels() {
+  for (int s = 0; s < TACH_NSEG; s++)
+    if (tachIsLabelSeg(s)) tachDrawLabel(s);
+}
+
 static int   tachShownSeg  = -1;      // сколько сегментов сейчас залито
 static float tachSmooth    = -1.0f;   // сглаженные обороты
 static int   tachTarget    = 0;       // цель, куда идём
@@ -1147,7 +1229,8 @@ static void tachRender(float rpm) {
 
   if (tachShownSeg < 0) {                         // первая отрисовка
     for (int s = 0; s < active; s++)
-      tachDrawSeg(s, tachColor((s + 1) * TACH_SEG_RPM));
+      if (!tachIsLabelSeg(s)) tachDrawSeg(s, tachColor((s + 1) * TACH_SEG_RPM));
+    tachDrawAllLabels();
     tachShownSeg = active;
     return;
   }
@@ -1155,10 +1238,10 @@ static void tachRender(float rpm) {
 
   if (active > tachShownSeg) {
     for (int s = tachShownSeg; s < active; s++)
-      tachDrawSeg(s, tachColor((s + 1) * TACH_SEG_RPM));
+      if (!tachIsLabelSeg(s)) tachDrawSeg(s, tachColor((s + 1) * TACH_SEG_RPM));
   } else {
     for (int s = active; s < tachShownSeg; s++)
-      tachEraseSeg(s);
+      if (!tachIsLabelSeg(s)) tachEraseSeg(s);
   }
   tachShownSeg = active;
 }
@@ -1247,10 +1330,10 @@ void drawGaugeStatic() {
   tachReset();               // дуга нарисуется заново при первом drawTach
   // цифры шкалы убраны: сегменты по 250 об/мин с зазорами уже дают деление,
   // а числа по краю круга задевались сегментами и рябили.
-  // Подпись RPM убрана — число оборотов теперь внизу, под ним место
-  // освободилось, а дуга сама себя объясняет.
-  label(78,  114, "km/h");
-  label(164, 114, "GEAR");
+  // Деления рисует сам тахометр: цифры стоят ВМЕСТО сегментов
+  // в полосе дуги (см. tachDrawAllLabels).
+  label(92,  102, "km/h");
+  label(160, 102, "GEAR");
   // статус связи и значок ошибок рисует drawGaugeIcons() —
   // они меняются на ходу, поэтому не в статике
 }
@@ -1276,24 +1359,24 @@ static void drawGaugeIcons() {
 
   if (link != lastLink) {
     lastLink = link;
-    lcd.fillRect(76, 34, 58, 18, TFT_BLACK);
+    lcd.fillRect(88, 200, 64, 16, TFT_BLACK);
     lcd.setTextDatum(middle_center);
     lcd.setTextSize(1);
-    if (link == 2)      { lcd.setTextColor(TFT_GREEN);    lcd.drawString("OBD",  105, 43); }
-    else if (link == 1) { lcd.setTextColor(TFT_CYAN);     lcd.drawString("WIFI", 105, 43); }
-    else                { lcd.setTextColor(TFT_DARKGREY); lcd.drawString("--",   105, 43); }
+    if (link == 2)      { lcd.setTextColor(TFT_GREEN);    lcd.drawString("OBD",  112, 208); }
+    else if (link == 1) { lcd.setTextColor(TFT_CYAN);     lcd.drawString("WIFI", 112, 208); }
+    else                { lcd.setTextColor(TFT_DARKGREY); lcd.drawString("--",   112, 208); }
   }
 
   if (err != lastErr) {
     lastErr = err;
-    lcd.fillRect(142, 34, 22, 20, TFT_BLACK);
+    lcd.fillRect(156, 198, 20, 20, TFT_BLACK);
     if (err) {                                  // (!) — есть коды ошибок
-      lcd.drawCircle(152, 43, 8, TFT_RED);
-      lcd.drawFastVLine(152, 38, 6, TFT_RED);
-      lcd.drawPixel(152, 47, TFT_RED);
-      lcd.drawPixel(153, 38, TFT_RED);         // чуть жирнее ствол
-      lcd.drawFastVLine(153, 38, 6, TFT_RED);
-      lcd.drawPixel(153, 47, TFT_RED);
+      lcd.drawCircle(165, 208, 7, TFT_RED);
+      lcd.drawFastVLine(165, 204, 5, TFT_RED);
+      lcd.drawPixel(165, 211, TFT_RED);
+      lcd.drawPixel(166, 204, TFT_RED);         // чуть жирнее ствол
+      lcd.drawFastVLine(166, 204, 5, TFT_RED);
+      lcd.drawPixel(166, 211, TFT_RED);
     }
   }
 }
@@ -1302,16 +1385,15 @@ static void drawGaugeIcons() {
 void drawGaugeValues() {
   char b[16];
 
-  // --- тахометр (дуга) + число оборотов (фикс. ширина 4 — без вспышки) ---
+  // --- тахометр: только дуга, число оборотов не показываем ---
+  // Вместо него по дуге расставлены деления 0..7 (тысячи об/мин),
+  // как на штатной приборной панели.
   drawTach(obd.rpm);
-  if (obd.rpm >= 0) snprintf(b, sizeof(b), "%4d", obd.rpm);
-  else              snprintf(b, sizeof(b), "----");
-  fieldId(0, 60, 166, 120, 28, b, TFT_WHITE, 3);
 
   // --- скорость (слева, фикс. ширина 3) ---
   if (obd.speed >= 0) snprintf(b, sizeof(b), "%3d", obd.speed);
   else                snprintf(b, sizeof(b), "  -");
-  fieldId(1, 38, 74, 80, 34, b, TFT_CYAN, 4);
+  fieldId(1, 60, 62, 64, 34, b, TFT_CYAN, 4);
 
   // --- передача (справа) ---
   String g; uint16_t gcol;
@@ -1319,18 +1401,19 @@ void drawGaugeValues() {
   else if (gearCalibrating)   { g = "c"; gcol = TFT_ORANGE; }
   else if (gears.count == 0)  { g = "-"; gcol = TFT_DARKGREY; }
   else                        { g = "N"; gcol = TFT_DARKGREY; }
-  fieldId(2, 122, 74, 80, 34, g, gcol, 4);
+  fieldId(2, 128, 62, 64, 34, g, gcol, 4);
 
   // --- температура ОЖ (слева): >95 красным крупнее, иначе зелёным ---
   bool overheat = (obd.coolant > 95);
   uint16_t tcol = (obd.coolant <= -200) ? TFT_DARKGREY
                 : overheat ? TFT_RED : TFT_GREEN;
-  if (obd.coolant > -200) snprintf(b, sizeof(b), "%d", obd.coolant);
-  else                    snprintf(b, sizeof(b), "--");
-  // Число крупно, единица мелко: "120 C" целиком крупным шрифтом в круг
-  // не влезает (90 px при доступных 88), а ужимать цифры не хочется.
-  fieldId(3, 30, 128, 72, 28, b, tcol, 3);
-  fieldId(14, 102, 136, 16, 16, "C", tcol, 1);
+  if (obd.coolant > -200) snprintf(b, sizeof(b), "%d\xF8" "C", obd.coolant);
+  else                    snprintf(b, sizeof(b), "--\xF8" "C");
+  // Перегрев показываем ТОЛЬКО красным цветом, без укрупнения шрифта:
+  // "120C" размером 4 требует 96 px, а зона внутри круга даёт 92 —
+  // шире сделать нельзя, иначе цифры делений на дуге налезают на поле.
+  // Потеря невелика: перегрев и так поднимает полноэкранную тревогу.
+  fieldId(3, 74, 156, 92, 26, b, tcol, 3);
 
   // --- напряжение АКБ (справа) ---
   uint16_t vcol = TFT_WHITE;
@@ -1339,9 +1422,9 @@ void drawGaugeValues() {
     else if (obd.voltage < 12.2) vcol = TFT_YELLOW;
     else vcol = TFT_GREEN;
     dtostrf(obd.voltage, 0, 1, b);
-  } else { strcpy(b, "--"); vcol = TFT_DARKGREY; }
-  fieldId(4, 118, 128, 76, 28, b, vcol, 3);
-  fieldId(15, 194, 136, 16, 16, "V", vcol, 1);
+    strcat(b, "V");
+  } else { strcpy(b, "--V"); vcol = TFT_DARKGREY; }
+  fieldId(4, 74, 118, 92, 26, b, vcol, 3);
 
   drawGaugeIcons();          // связь (OBD/WIFI) + значок ошибок
 }
@@ -1668,13 +1751,32 @@ void enterSetupMode() {
   lcd.drawString(String("pass: ") + AP_PASS, CX, CY + 26);
   lcd.drawString(String("http://") + ip.toString() + "/", CX, CY + 44);
   lcd.setTextColor(TFT_DARKGREY);
-  lcd.drawString("hold btn to exit", CX, CY + 66);
+  lcd.drawString("hold btn to exit", CX, CY + 64);
+
+  // строка режима яркости — обновляется по касанию
+  auto drawBright = [&]() {
+    lcd.fillRect(20, CY + 78, 200, 14, TFT_BLACK);
+    lcd.setTextDatum(middle_center);
+    lcd.setTextSize(1);
+    lcd.setTextColor(nightMode ? TFT_CYAN : TFT_YELLOW);
+    lcd.drawString(nightMode ? "tap: NIGHT (dim)" : "tap: DAY (bright)", CX, CY + 84);
+  };
+  drawBright();
 
   btnHoldQueue = 0;                    // сбросить событие входа
   btnQueue = 0;
   uint32_t t0 = millis();
   for (;;) {
     web.handleClient();
+    // короткое касание — переключить день/ночь и сразу применить
+    if (btnQueue) {
+      btnQueue = 0;
+      nightMode = !nightMode;
+      brightApply();
+      brightSave(prefs);
+      drawBright();
+      Serial.printf("яркость: %s\n", nightMode ? "ночь" : "день");
+    }
     // выход из setup — снова долгое удержание. Игнорируем первые 1.5 с,
     // чтобы «дожатие» кнопки при входе не выкинуло сразу обратно.
     if (btnHoldQueue && millis() - t0 > 1500) {
@@ -1731,7 +1833,8 @@ void setup() {
   bool disp = lcd.init();
   Serial.printf("lcd.init() -> %d\n", disp);
   lcd.setRotation(2);   // экран перевёрнут на 180°
-  lcd.setBrightness(255);
+  brightLoad(prefs);
+  brightApply();
 
   lcd.fillScreen(TFT_BLACK);
   lcd.setTextDatum(middle_center);
