@@ -1305,6 +1305,11 @@ static FieldCache fcache[FIELD_MAX];
 
 static void fieldId(int id, int x, int y, int w, int h, const char* s,
                     uint16_t col, uint8_t size) {
+  if (id < 0 || id >= FIELD_MAX) return;
+  // c_str() у пустого String на ESP32 возвращает nullptr (буфер не выделен),
+  // а не "". Без этой подстраховки strcmp/drawString падают на первом же
+  // ещё не декодированном параметре — экран PARAMS оставался пустым.
+  if (!s) s = "--";
   FieldCache& c = fcache[id];
   if (c.init && c.col == col && c.size == size && strcmp(c.s, s) == 0) return;
 

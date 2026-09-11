@@ -7,11 +7,22 @@
 // единица, функция цвета (аномалии). Выбор — битовая маска в NVS.
 // ============================================================
 
+// ---- палитра ----
+#define C_WHITE  0xFFFF
+#define C_GREEN  0x07E0
+#define C_YELLOW 0xFFE0
+#define C_ORANGE 0xFD20
+#define C_RED    0xF800
+#define C_CYAN   0x07FF
+#define C_GREY   0x8410
+
 // сырые байты ответа PID (после mode+pid), их количество
 struct PidRaw { uint8_t b[6]; int n; };
 
 // значение параметра: число + строка для показа + цвет
-struct PidVal { float v; bool valid; String text; uint16_t color; };
+// text инициализируем строкой, а не пустым String: у пустого c_str()
+// на ESP32 равен nullptr, и отрисовка получала бы битый указатель.
+struct PidVal { float v = 0; bool valid = false; String text = "--"; uint16_t color = C_GREY; };
 
 typedef PidVal (*PidDecoder)(const PidRaw&);
 
@@ -23,17 +34,10 @@ struct PidDef {
   PidDecoder  decode;
 };
 
-// ---- палитра ----
-#define C_WHITE  0xFFFF
-#define C_GREEN  0x07E0
-#define C_YELLOW 0xFFE0
-#define C_ORANGE 0xFD20
-#define C_RED    0xF800
-#define C_CYAN   0x07FF
-#define C_GREY   0x8410
-
-static PidVal mk(float v, const String& t, uint16_t c) { return {v, true, t, c}; }
-static PidVal bad() { return {0, false, "--", C_GREY}; }
+static PidVal mk(float v, const String& t, uint16_t c) {
+  PidVal p; p.v = v; p.valid = true; p.text = t; p.color = c; return p;
+}
+static PidVal bad() { return PidVal(); }   // v=0, valid=false, text="--", серый
 
 // ---------- декодеры ----------
 static PidVal d_rpm(const PidRaw& r) {
