@@ -198,11 +198,25 @@ String elmCmd(const String& cmd, uint32_t timeoutMs = 800) {
   return "";
 }
 
+// Признак «ЭБУ занят, ответ будет позже» — негативный ответ 7F <mode> 78
+// (ISO 14229 responsePending). Замер в машине показал: ~20% запросов
+// получают именно его, и раньше они считались битыми — отсюда были
+// fails=8..31 при полном отсутствии таймаутов.
+static bool lastWasPending = false;
+
 int parsePid(const String& resp, uint8_t expectMode, uint8_t expectPid, uint8_t* out, int maxOut) {
   String s = resp;
   s.toUpperCase();
+  lastWasPending = false;
   if (s.indexOf("NO DATA") >= 0 || s.indexOf("STOPPED") >= 0 ||
       s.indexOf("ERROR")   >= 0 || s.indexOf("UNABLE") >= 0 || s.indexOf("?") >= 0) return 0;
+  // 7F <mode> 78 — не ошибка, а «подожди»: помечаем, чтобы повторить запрос
+  {
+    String nr = "7F"; char mb[4]; snprintf(mb, sizeof(mb), "%02X", expectMode);
+    nr += mb; nr += "78";
+    String flat = s; flat.replace(" ", "");
+    if (flat.indexOf(nr) >= 0) { lastWasPending = true; return 0; }
+  }
 
   uint8_t bytes[32]; int n = 0; int i = 0;
   while (i < (int)s.length() && n < 32) {
@@ -281,6 +295,21 @@ bool queryFast01(uint8_t pid, uint8_t* out, int maxOut, int& cnt) {
   }
 
   cnt = parsePid(r, 0x01, pid, out, maxOut);
+
+  // ЭБУ ответил «занят, подожди» (7F 01 78) — это не сбой. Даём короткую
+  // паузу и перезапрашиваем один раз: замер в машине показал, что так
+  // отвечает примерно каждый пятый запрос, и все они уходили в fails.
+  if (cnt <= 0 && lastWasPending) {
+    delay(8);
+    t0 = millis();
+    r = elmCmd(cmd, FAST_TIMEOUT_MS);
+    lastRtt = (uint16_t)(millis() - t0);
+    if (r.isEmpty()) { lastWasTimeout = true; return false; }
+    cnt = parsePid(r, 0x01, pid, out, maxOut);
+    if (cnt > 0) return true;
+    if (lastWasPending) { dlogFailPending(); return false; }
+  }
+
   if (cnt <= 0) {
     dlogBadResp(r.c_str());               // образец в лог (переживёт поездку)
     static uint32_t tBad = 0;
@@ -599,15 +628,16 @@ void webBegin() {
   });
   // Лог замеров текстом: и с телефона в setup-режиме, и с компа по /log
   web.on("/log", []() {
-    String s = "sec\thz\tfails\ttouts\trtt_avg\trtt_min\trtt_max\trpm_max\tspd_max\tlink\n";
+    String s = "sec\thz\tfails\ttouts\tpend\trtt_avg\trtt_min\trtt_max\trpm_max\tspd_max\tlink\n";
     s.reserve(2048);
     int start = (dlog.count < LOG_SLOTS) ? 0 : dlog.head;
     for (int i = 0; i < dlog.count; i++) {
       const LogSlot& sl = dlog.slot[(start + i) % LOG_SLOTS];
       char line[110];
-      snprintf(line, sizeof(line), "%u\t%.1f\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\n",
-               sl.sec, sl.polls / 10.0f, sl.fails, sl.touts, sl.rttAvg, sl.rttMin,
-               sl.rttMax, sl.rpmMax, sl.spdMax, (sl.flags & 1) ? 1 : 0);
+      snprintf(line, sizeof(line), "%u\t%.1f\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\n",
+               sl.sec, sl.polls / 10.0f, sl.fails, sl.touts, sl.pend,
+               sl.rttAvg, sl.rttMin, sl.rttMax, sl.rpmMax, sl.spdMax,
+               (sl.flags & 1) ? 1 : 0);
       s += line;
     }
     web.send(200, "text/plain; charset=utf-8", s);
@@ -1021,9 +1051,18 @@ static uint16_t tachColor(int rpm) {
 
 // Сегмент как сплошная трапеция: две пары треугольников + заливка щелей
 // дуговыми линиями. Без просветов на любом радиусе.
-static void tachDrawSeg(int seg, uint16_t col) {
-  float a0 = TACH_A_START + TACH_A_SPAN * seg       / (float)TACH_NSEG + TACH_GAP_DEG;
-  float a1 = TACH_A_START + TACH_A_SPAN * (seg + 1) / (float)TACH_NSEG - TACH_GAP_DEG;
+// frac (0..1] — какая доля сегмента залита, для плавного «дорастания»
+// последнего деления. Именно это даёт видимую плавность: раньше
+// интерполировалось только значение, а рисовалось всё равно целыми
+// сегментами по 250 об/мин, поэтому между делениями картинка не менялась.
+static void tachDrawSegF(int seg, uint16_t col, float frac) {
+  if (frac <= 0.0f) return;
+  if (frac > 1.0f) frac = 1.0f;
+  float base = TACH_A_START + TACH_A_SPAN * seg / (float)TACH_NSEG;
+  float full = TACH_A_SPAN / (float)TACH_NSEG;
+  float a0 = base + TACH_GAP_DEG;
+  float a1 = base + full * frac - TACH_GAP_DEG;
+  if (a1 <= a0) a1 = a0 + 0.4f;          // минимальный видимый огрызок
   float r0 = a0 * DEG_TO_RAD, r1 = a1 * DEG_TO_RAD;
   int x0i = CX + cosf(r0) * TACH_R_IN,  y0i = CY + sinf(r0) * TACH_R_IN;
   int x0o = CX + cosf(r0) * TACH_R_OUT, y0o = CY + sinf(r0) * TACH_R_OUT;
@@ -1040,37 +1079,111 @@ static void tachDrawSeg(int seg, uint16_t col) {
   }
 }
 
-// сброс кэша — при полной перерисовке экрана
-static int tachShownSeg = -1;
-static void tachReset() { tachShownSeg = -1; }
+// целый сегмент — частый случай
+static void tachDrawSeg(int seg, uint16_t col) { tachDrawSegF(seg, col, 1.0f); }
 
-// нарисовать шкалу: только горящие сегменты (фон уже чёрный)
-static void tachDrawAll(int active) {
-  for (int s = 0; s < active; s++)
-    tachDrawSeg(s, tachColor((s + 1) * TACH_SEG_RPM));
+// СТИРАНИЕ сегмента — той же формой, что заливка, плюс небольшой запас
+// по углу и радиусу. Сегменты рисуются только целиком, поэтому геометрия
+// совпадает и остатков не бывает; запас страхует от округления координат.
+#define TACH_ERASE_PAD 0.8f
+static void tachEraseSeg(int seg) {
+  float base = TACH_A_START + TACH_A_SPAN * seg / (float)TACH_NSEG;
+  float full = TACH_A_SPAN / (float)TACH_NSEG;
+  float a0 = base + TACH_GAP_DEG - TACH_ERASE_PAD;
+  float a1 = base + full - TACH_GAP_DEG + TACH_ERASE_PAD;
+  float r0 = a0 * DEG_TO_RAD, r1 = a1 * DEG_TO_RAD;
+  // радиусы С ЗАПАСОМ в обе стороны — без этого 12 из 28 сегментов
+  // оставляли по 1-6 пикселей (проверено пиксельной симуляцией)
+  const int rin = TACH_R_IN - 1, rout = TACH_R_OUT + 1;
+  int x0i = CX + cosf(r0) * rin,  y0i = CY + sinf(r0) * rin;
+  int x0o = CX + cosf(r0) * rout, y0o = CY + sinf(r0) * rout;
+  int x1i = CX + cosf(r1) * rin,  y1i = CY + sinf(r1) * rin;
+  int x1o = CX + cosf(r1) * rout, y1o = CY + sinf(r1) * rout;
+  lcd.fillTriangle(x0i, y0i, x0o, y0o, x1o, y1o, TACH_OFF);
+  lcd.fillTriangle(x0i, y0i, x1o, y1o, x1i, y1i, TACH_OFF);
+  for (float a = a0; a <= a1; a += 0.15f) {   // мелкий шаг, чтобы без щелей
+    float rad = a * DEG_TO_RAD, ca = cosf(rad), sa = sinf(rad);
+    lcd.drawLine(CX + ca * rin,  CY + sa * rin,
+                 CX + ca * rout, CY + sa * rout, TACH_OFF);
+  }
 }
 
-// инкрементально: дорисовать/погасить только изменившиеся сегменты
-static void drawTach(int rpm) {
+// ---- Плавная дуга -----------------------------------------------------
+// Что было не так в прошлой попытке:
+//  1) сглаживалось только ЗНАЧЕНИЕ, а рисовалось целыми сегментами по
+//     250 об/мин — между делениями картинка не менялась вовсе, дуга
+//     дёргалась так же, только с запозданием;
+//  2) drawTachAnim() рисовал дугу из одной ветки цикла, а drawGaugeValues()
+//     из другой звал drawTach(obd.rpm) с сырым значением — две функции
+//     спорили за одну дугу разными числами, отсюда «кривое» отображение.
+// Решение: ЕДИНСТВЕННАЯ точка отрисовки (tachRender), сглаженное значение
+// хранится в одном месте, а последний сегмент рисуется ДРОБНО.
+
+static int   tachShownSeg  = -1;      // сколько сегментов сейчас залито
+static float tachSmooth    = -1.0f;   // сглаженные обороты
+static int   tachTarget    = 0;       // цель, куда идём
+
+static void tachReset() { tachShownSeg = -1; tachSmooth = -1.0f; }
+
+// Отрисовать состояние, соответствующее rpm. Меняет только то, что
+// отличается от уже нарисованного — без полной перерисовки.
+static void tachRender(float rpm) {
   if (rpm < 0) rpm = 0;
   if (rpm > RPM_MAX) rpm = RPM_MAX;
-  int active = (rpm + TACH_SEG_RPM - 1) / TACH_SEG_RPM;
-  if (active > TACH_NSEG) active = TACH_NSEG;
 
-  if (tachShownSeg < 0) { tachDrawAll(active); tachShownSeg = active; return; }
-  if (active == tachShownSeg) return;
+  float units = rpm / (float)TACH_SEG_RPM;      // сколько сегментов «в рублях»
+  int   whole = (int)units;                      // целых залито
+  float frac  = units - whole;                   // остаток на следующий
+  if (whole > TACH_NSEG) { whole = TACH_NSEG; frac = 0.0f; }
+
+  // Сегменты только ЦЕЛИКОМ. Дробная заливка давала точки-остатки:
+  // fillTriangle при разных углах даёт разный растр, и стереть частично
+  // залитый сегмент «в ноль» надёжно не выходит. Плавность даёт
+  // сглаживание значения (tachTick), а рисуем всегда целыми делениями —
+  // тогда стирание и заливка идут одной и той же геометрией.
+  int active = (int)(units + 0.5f);               // округление к ближайшему
+  if (active > TACH_NSEG) active = TACH_NSEG;
+  if (active < 0) active = 0;
+
+  if (tachShownSeg < 0) {                         // первая отрисовка
+    for (int s = 0; s < active; s++)
+      tachDrawSeg(s, tachColor((s + 1) * TACH_SEG_RPM));
+    tachShownSeg = active;
+    return;
+  }
+  if (active == tachShownSeg) return;             // ничего не изменилось
 
   if (active > tachShownSeg) {
     for (int s = tachShownSeg; s < active; s++)
       tachDrawSeg(s, tachColor((s + 1) * TACH_SEG_RPM));
   } else {
     for (int s = active; s < tachShownSeg; s++)
-      tachDrawSeg(s, TACH_OFF);
+      tachEraseSeg(s);
   }
   tachShownSeg = active;
 }
 
-static void drawTachAnim() { }   // no-op (анимация убрана)
+// Задать целевые обороты (вызывается после опроса). Саму отрисовку
+// делает tachTick() — так у дуги ровно один хозяин.
+static void drawTach(int rpm) {
+  if (rpm < 0) { tachTarget = 0; if (tachSmooth < 0) tachSmooth = 0; return; }
+  tachTarget = rpm;
+  if (tachSmooth < 0) { tachSmooth = rpm; tachRender(tachSmooth); }
+}
+
+// Шаг сглаживания — звать часто (каждые ~25 мс) независимо от опроса.
+// Экспоненциальное приближение к цели: быстро реагирует на рывок газа,
+// но убирает ступеньки между редкими ответами адаптера.
+static void tachTick() {
+  if (tachSmooth < 0) return;
+  float d = tachTarget - tachSmooth;
+  if (fabsf(d) < 6.0f) {                 // почти пришли — не дёргаем пиксели
+    if (tachSmooth != tachTarget) { tachSmooth = tachTarget; tachRender(tachSmooth); }
+    return;
+  }
+  tachSmooth += d * 0.35f;               // 35% остатка за кадр
+  tachRender(tachSmooth);
+}
 
 // Значение в зоне (x,y,w,h). Перерисовывает ТОЛЬКО если текст/цвет/размер
 // изменились — иначе не трогает пиксели (нет мелькания при том же значении).
@@ -1094,8 +1207,13 @@ static void fieldId(int id, int x, int y, int w, int h, const String& s,
     lcd.setTextColor(col, TFT_BLACK);
     lcd.drawString(s, x + w / 2, y + h / 2);
   } else {
-    // длина или размер изменились — чистим зону и рисуем
-    lcd.fillRect(x, y, w, h, TFT_BLACK);
+    // Длина или размер изменились — чистим зону и рисуем.
+    // Запас по вертикали обязателен: крупный шрифт (size 4 = ~32 px)
+    // выше зоны h=30, поэтому при возврате к меньшему размеру от него
+    // оставались верхушки букв (красные полоски над температурой).
+    // Запас только ВВЕРХ: снизу на y+h+5 уже стоят подписи (TEMP/BATT),
+    // их затирать нельзя. Крупный шрифт вылезает именно вверх.
+    lcd.fillRect(x, y - 7, w, h + 8, TFT_BLACK);
     lcd.setTextColor(col);
     lcd.drawString(s, x + w / 2, y + h / 2);
   }
@@ -1765,7 +1883,11 @@ void loop() {
   if (demoOn) {
     static uint32_t demoFps = 0, demoCnt = 0, demoT = 0;
     pollDemo();
-    if (currentScreen == SCREEN_GAUGE)  drawGaugeValues();
+    if (currentScreen == SCREEN_GAUGE) {
+      drawGaugeValues();
+      static uint32_t tAnimD = 0;
+      if (millis() - tAnimD >= 25) { tAnimD = millis(); tachTick(); }
+    }
     if (currentScreen == SCREEN_ACCEL)  { accelUpdate(obd.speed); drawAccel(); }
     if (currentScreen == SCREEN_PARAMS) drawParamsValues();
     // счётчик FPS в Serial раз в секунду
@@ -1798,12 +1920,14 @@ void loop() {
       if (gearUpdate(obd.rpm, obd.speed, obd.throttle)) gearSave(prefs);
       if (accelUpdate(obd.speed)) accelSave(prefs);
       drawGaugeValues();
-    } else {
-      // между опросами — гоним интерполяцию тахо-дуги для плавности
-      static uint32_t tAnim = 0;
-      if (millis() - tAnim >= 30) { tAnim = millis(); drawTachAnim(); }
-      if (!ready && millis() - tRedraw >= 300) { tRedraw = millis(); drawGaugeValues(); }
+    } else if (!ready && millis() - tRedraw >= 300) {
+      tRedraw = millis(); drawGaugeValues();
     }
+    // Сглаживание дуги — ВСЕГДА и в одном месте, независимо от того,
+    // был ли в этом проходе опрос. Раньше анимация жила в else-ветке и
+    // спорила с drawGaugeValues() за одну и ту же дугу — дуга «кривила».
+    static uint32_t tAnim = 0;
+    if (millis() - tAnim >= 25) { tAnim = millis(); tachTick(); }
   }
 
   // --- ACCEL: только скорость, максимально часто ---

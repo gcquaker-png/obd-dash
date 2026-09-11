@@ -9,7 +9,7 @@
 
 struct AlertCfg {
   int   coolMax   = 105;   // °C — перегрев ОЖ
-  float voltMin   = 12.0;  // В — на заведённой (RPM>500) ниже = не заряжает
+  float voltMin   = 11.6;  // В — ниже на прогретой = генератор не заряжает
   int   rpmMax    = 6500;  // об/мин — отсечка
   uint8_t magic   = 0xA5;
 };
@@ -25,6 +25,10 @@ inline void alertLoad(Preferences& p) {
     p.getBytes("alertcfg", &alertCfg, sizeof(AlertCfg));
   p.end();
   if (alertCfg.magic != 0xA5) alertCfg = AlertCfg();
+  // Миграция: 12.0 В было слишком высоко — на прогретой машине штатные
+  // 11.7-11.9 В давали ложную тревогу «нет заряда» (видно в журнале
+  // аномалий: три срабатывания на 11.5-11.8 В). Опускаем до 11.6.
+  if (alertCfg.voltMin > 11.9f) alertCfg.voltMin = 11.6f;
 }
 inline void alertSave(Preferences& p) {
   p.begin("obd", false);

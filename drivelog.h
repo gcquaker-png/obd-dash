@@ -26,6 +26,7 @@ struct LogSlot {
   uint16_t polls;      // сколько успешных проходов опроса за слот
   uint16_t fails;      // неудачные запросы ВСЕГО
   uint16_t touts;      // из них таймаутов (ответа не было совсем)
+  uint16_t pend;       // из них «ЭБУ занят» (7F..78) даже после повтора
   uint16_t rttAvg;     // средний отклик адаптера, мс
   uint16_t rttMin;
   uint16_t rttMax;
@@ -66,7 +67,7 @@ static DriveLog dlog;
 
 // --- накопители текущего слота ---
 static uint32_t dlSlotStart = 0;
-static uint32_t dlPolls = 0, dlFails = 0, dlTouts = 0;
+static uint32_t dlPolls = 0, dlFails = 0, dlTouts = 0, dlPend = 0;
 static uint32_t dlRttSum = 0;
 static uint16_t dlRttMin = 0xFFFF, dlRttMax = 0;
 static uint16_t dlRpmMax = 0;
@@ -115,6 +116,8 @@ inline void dlogPoll(uint16_t rtt, int rpm, int spd) {
 // timeout=true — ответа не было совсем; false — ответ пришёл, но не распознан
 // (NO DATA / ошибка протокола). Лечится это по-разному, потому и считаем врозь.
 inline void dlogFail(bool timeout) { dlFails++; if (timeout) dlTouts++; }
+// «занят» и после повторного запроса — считаем отдельно от обычных сбоев
+inline void dlogFailPending() { dlPend++; }
 
 // Состояние радио на момент слота — чтобы проверить гипотезу «своя точка
 // доступа отъедает эфир у связи с адаптером» (у ESP32-C3 одно радио).
@@ -194,6 +197,7 @@ inline bool dlogTick() {
   s.polls  = (uint16_t)(dlPolls * 1000UL / (dur ? dur : 1) * 10);  // 0.1 Гц
   s.fails  = (uint16_t)dlFails;
   s.touts  = (uint16_t)dlTouts;
+  s.pend   = (uint16_t)dlPend;
   s.rttAvg = dlPolls ? (uint16_t)(dlRttSum / dlPolls) : 0;
   s.rttMin = (dlRttMin == 0xFFFF) ? 0 : dlRttMin;
   s.rttMax = dlRttMax;
@@ -207,7 +211,7 @@ inline bool dlogTick() {
   if (dlog.count < LOG_SLOTS) dlog.count++;
 
   dlSlotStart = millis();
-  dlPolls = dlFails = dlTouts = dlRttSum = 0;
+  dlPolls = dlFails = dlTouts = dlPend = dlRttSum = 0;
   dlRttMin = 0xFFFF; dlRttMax = 0;
   dlRpmMax = 0; dlSpdMax = 0; dlFlags = 0; dlApCli = 0;
   dlDirty = true;
@@ -222,12 +226,12 @@ inline void dlogDump() {
   Serial.printf("bad1=[%s]\nbad2=[%s]\nsuffix_off=%u\n",
                 dlog.badResp[0]  ? dlog.badResp  : "-",
                 dlog.badResp2[0] ? dlog.badResp2 : "-", dlog.suffixOff);
-  Serial.println("sec\thz\tfails\ttouts\trtt_avg\trtt_min\trtt_max\trpm_max\tspd_max\tlink\tap\tapcli\trssi");
+  Serial.println("sec\thz\tfails\ttouts\tpend\trtt_avg\trtt_min\trtt_max\trpm_max\tspd_max\tlink\tap\tapcli\trssi");
   int start = (dlog.count < LOG_SLOTS) ? 0 : dlog.head;
   for (int i = 0; i < dlog.count; i++) {
     const LogSlot& s = dlog.slot[(start + i) % LOG_SLOTS];
-    Serial.printf("%u\t%.1f\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%d\n",
-                  s.sec, s.polls / 10.0f, s.fails, s.touts,
+    Serial.printf("%u\t%.1f\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%d\n",
+                  s.sec, s.polls / 10.0f, s.fails, s.touts, s.pend,
                   s.rttAvg, s.rttMin, s.rttMax,
                   s.rpmMax, s.spdMax, (s.flags & 1) ? 1 : 0,
                   (s.flags & 2) ? 1 : 0, s.apClients, s.rssi);
