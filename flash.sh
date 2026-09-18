@@ -41,9 +41,12 @@ case "${1:-flash}" in
   bin)
     OUT="$SKETCH/_build"
     "$CLI" compile --fqbn "$FQBN" --build-property "$VPROP" --output-dir "$OUT" "$SKETCH"
+    # Человеческое имя файла: на телефоне видно версию, переименовывать не надо.
+    NAME="obd-dash-v${SEMVER}.bin"
+    cp "$OUT/obd_dash.ino.bin" "$OUT/$NAME"
     echo
     echo ">>> Файл для OTA (v$SEMVER rev $REV):"
-    ls -la "$OUT"/*.ino.bin
+    ls -la "$OUT/$NAME"
     ;;
   monitor)
     "$CLI" monitor -p "$PORT" --config baudrate=115200

@@ -14,6 +14,7 @@
 #define FW_MD5_URL "https://github.com/gcquaker-png/obd-dash/releases/latest/download/firmware.md5"
 #include "version.h"
 #include "dtc_db.h"
+#include "rufont.h"
 #include "pids.h"
 #include "gear.h"
 #include "alerts.h"
@@ -46,8 +47,10 @@
 // (GPIO 21 на этой плате шумит — не использовать)
 // Логика простая: любое чистое касание >= BTN_MIN_MS -> следующий экран.
 // Опрос по аппаратному таймеру каждые 5 мс, независимо от отрисовки.
-#define BTN_PIN       20
-#define BTN_ACTIVE    HIGH
+// Кнопка BOOT на плате: GPIO9, активна НИЗКИМ (на плате подтяжка к +3.3).
+// Сенсорную площадку TTP223 (GPIO20, активна HIGH) больше не используем.
+#define BTN_PIN       9
+#define BTN_ACTIVE    LOW
 // TTP223 на этой плате «звенит»: одно касание = серия импульсов ~90 мс.
 // Ловим ПЕРВЫЙ фронт LOW->HIGH как нажатие, дальше глухая пауза —
 // весь звон и дребезг внутри неё игнорируются. Работает и в toggle-режиме.
@@ -117,7 +120,6 @@ LGFX lcd;
 // ============================================================
 enum Screen { SCREEN_GAUGE, SCREEN_PARAMS, SCREEN_ACCEL, SCREEN_DTC };
 const int SCREEN_COUNT = 4;
-
 // Экран замера разгона показывается только по галочке в веб-морде:
 // в обычной езде он не нужен и мешает листать. Хранится в NVS.
 static bool accelScreenOn = false;
@@ -141,6 +143,10 @@ PidVal   pidVals[PID_DEFS_LEN];        // последние декодиров�
 WebServer web(80);
 
 volatile bool dirtyFull = true;   // требуется полная перерисовка экрана (ISR/веб)
+// Выход из режима настройки по кнопке в веб-морде. Setup крутит свой цикл,
+// где живёт только web.handleClient() и кнопка — флаг проверяется там же.
+volatile bool setupExitReq = false;
+volatile bool setupActive  = false;   // сейчас в режиме настройки
 
 // ---- ЯРКОСТЬ ЭКРАНА ------------------------------------------------
 // Ночью полная яркость слепит. Автоопределения нет: габариты в
@@ -148,22 +154,24 @@ volatile bool dirtyFull = true;   // требуется полная перер�
 // диагностический разъём не добраться), а часов реального времени на
 // плате нет. Поэтому режим переключается вручную — коротким касанием
 // в режиме настройки, и запоминается в NVS.
+// demoOn объявлен ниже (рядом с генератором), а brightLoad/Save читают
+// и пишут его вместе с остальными настройками — нужно предобъявление.
+extern bool demoOn;
+
 #define BRIGHT_DAY   255
-#define BRIGHT_NIGHT_DEF 38    // 15% от 255
+#define BRIGHT_NIGHT_DEF 38            // 15% от 255 — проверено в машине
 static bool    nightMode   = false;
 static uint8_t nightLevel  = BRIGHT_NIGHT_DEF;
 
-// Яркость — собственным каналом LEDC на пине подсветки.
-// Проверено отдельным тестом на этой плате: setBrightness() (Light_PWM)
-// яркость НЕ меняет, а ledcWrite — меняет. Тонкость: привязывать пин к
-// своему каналу нужно ПОСЛЕ lcd.init(), иначе библиотека при инициализации
-// перехватывает пин обратно и ШИМ не действует.
+// lcd.setBrightness() на этой плате НЕ РАБОТАЕТ: Light_PWM из LovyanGFX
+// пин подсветки не держит (проверено — duty пишется, яркость не меняется).
+// Поэтому берём пин своим каналом LEDC. ledcAttachPin обязательно ПОСЛЕ
+// lcd.init(), иначе библиотека при инициализации перехватывает пин назад.
 #define BL_PWM_CH   5
 #define BL_PWM_FREQ 5000
 #define BL_PWM_BITS 8
 static bool blPwmReady = false;
 
-// --- тела функций яркости: нужны после объявления lcd ---
 inline void brightBegin() {           // звать ОДИН раз, после lcd.init()
   lcd.setBrightness(255);             // отпустить Light_PWM на максимум
   ledcSetup(BL_PWM_CH, BL_PWM_FREQ, BL_PWM_BITS);
@@ -171,7 +179,7 @@ inline void brightBegin() {           // звать ОДИН раз, после 
   blPwmReady = true;
 }
 inline void brightApply() {
-  if (!blPwmReady) return;            // до brightBegin пин ещё у библиотеки
+  if (!blPwmReady) return;
   ledcWrite(BL_PWM_CH, nightMode ? nightLevel : BRIGHT_DAY);
 }
 
@@ -179,9 +187,9 @@ inline void brightLoad(Preferences& p) {
   p.begin("obd", true);
   nightMode  = p.getBool("night", false);
   accelScreenOn = p.getBool("accelscr", false);
+  demoOn = p.getBool("demo", demoOn);
   nightLevel = p.getUChar("nightlv", BRIGHT_NIGHT_DEF);
-  // Миграция: значения от прежних экспериментов (в т.ч. 230 «90%»)
-  // сбрасываем к текущему умолчанию 15%.
+  // старые эксперименты (45, 230) сбрасываем к текущему умолчанию
   if (nightLevel < 10 || nightLevel > 200) nightLevel = BRIGHT_NIGHT_DEF;
   p.end();
 }
@@ -189,6 +197,7 @@ inline void brightSave(Preferences& p) {
   p.begin("obd", false);
   p.putBool("night", nightMode);
   p.putBool("accelscr", accelScreenOn);
+  p.putBool("demo", demoOn);
   p.putUChar("nightlv", nightLevel);
   p.end();
 }
@@ -230,8 +239,54 @@ volatile bool screenChanged = false;
 // бы второй write (одиночный '\r'), пока не придёт ACK — ~40 мс задержки
 // delayed-ACK НА КАЖДУЮ команду. Один write + setNoDelay при коннекте убирают это.
 static char elmBuf[24];
+// Ответ ВСЕГДА заканчивается символом '>' (приглашение ELM). Если прошлый
+// запрос отвалился по таймауту или был брошен из-за смены экрана, его ответ
+// прилетает позже — и достаётся СЛЕДУЮЩЕМУ запросу. В логе это видно прямо:
+//   SLOW pid=0C НЕ РАЗОБРАН: [410D00]   <- ответ на 0D пришёл на запрос 0C
+// Поэтому перед новым запросом дочитываем хвост до '>', а не просто
+// выгребаем то, что уже успело прийти.
+static void elmDrain(uint32_t maxMs = 120) {
+  uint32_t t0 = millis();
+  bool seen = false;
+  while (millis() - t0 < maxMs) {
+    if (!elm.available()) {
+      if (seen) break;           // тишина и хвост уже съеден
+      delay(1);
+      continue;
+    }
+    char c = elm.read();
+    seen = true;
+    if (c == '>') break;         // хвост дочитан ровно до приглашения
+  }
+}
+
+// Линия «поехала»: ответы приходят на один запрос позже. Одного выгребания
+// мало — опоздавший ответ может прийти уже ПОСЛЕ него. Тогда шлём ATI (быстрая
+// безобидная команда) и читаем всё до её приглашения: это выравнивает поток
+// заново, чем бы он ни был забит.
+static void elmResync() {
+  elm.write((const uint8_t*)"ATI" "\r", 4);
+  uint32_t t0 = millis();
+  int prompts = 0;
+  while (millis() - t0 < 600) {
+    if (!elm.available()) { delay(1); continue; }
+    if (elm.read() == '>') {
+      // хвостов может быть несколько (по одному на каждый зависший ответ);
+      // нам нужен последний — ждём тишины после него
+      prompts++;
+      uint32_t q = millis();
+      while (millis() - q < 60) {
+        if (elm.available()) { q = millis(); elm.read(); }
+        else delay(1);
+      }
+      break;
+    }
+  }
+  Serial.printf("ELM ресинхронизация (приглашений: %d)\n", prompts);
+}
+
 String elmCmd(const String& cmd, uint32_t timeoutMs = 800) {
-  while (elm.available()) elm.read();
+  elmDrain();
   int n = cmd.length();
   if (n > (int)sizeof(elmBuf) - 2) n = sizeof(elmBuf) - 2;
   memcpy(elmBuf, cmd.c_str(), n);
@@ -258,7 +313,9 @@ String elmCmd(const String& cmd, uint32_t timeoutMs = 800) {
       t0 = millis();
       continue;                                // данные идут — не спим
     }
-    if (screenChanged) return "";   // кнопка сменила экран — бросаем запрос
+    // Кнопка сменила экран — бросаем ожидание. Ответ ещё прилетит, но его
+    // съест elmDrain() перед следующим запросом.
+    if (screenChanged) return "";
     delay(1);
   }
   return "";
@@ -269,11 +326,20 @@ String elmCmd(const String& cmd, uint32_t timeoutMs = 800) {
 // получают именно его, и раньше они считались битыми — отсюда были
 // fails=8..31 при полном отсутствии таймаутов.
 static bool lastWasPending = false;
+// Ответ пришёл на другой PID — поток ответов съехал на один запрос.
+static bool lastWasDesync = false;
+
+// Когда ЭБУ в последний раз реально ответил данными. При перезапуске
+// двигателя адаптер сохраняет WiFi и TCP, но теряет сессию с ЭБУ: на ATRV
+// (свой вольтметр) отвечает, а на любой PID — NO DATA. Ни WiFi, ни TCP при
+// этом не рвутся, поэтому сторож смотрит именно на успешные ответы.
+static uint32_t lastPidOkMs = 0;
 
 int parsePid(const String& resp, uint8_t expectMode, uint8_t expectPid, uint8_t* out, int maxOut) {
   String s = resp;
   s.toUpperCase();
   lastWasPending = false;
+  lastWasDesync = false;
   if (s.indexOf("NO DATA") >= 0 || s.indexOf("STOPPED") >= 0 ||
       s.indexOf("ERROR")   >= 0 || s.indexOf("UNABLE") >= 0 || s.indexOf("?") >= 0) return 0;
   // 7F <mode> 78 — не ошибка, а «подожди»: помечаем, чтобы повторить запрос
@@ -292,74 +358,74 @@ int parsePid(const String& resp, uint8_t expectMode, uint8_t expectPid, uint8_t*
     bytes[n++] = (uint8_t)strtol(s.substring(i, i + 2).c_str(), nullptr, 16);
     i += 2;
   }
+  // Ответ на ЧУЖОЙ pid = линия рассинхронизирована. Отмечаем, чтобы
+  // вызывающий выровнял поток, а не считал это просто промахом.
+  for (int k = 0; k + 1 < n; k++) {
+    if (bytes[k] == (0x40 | expectMode) && bytes[k + 1] != expectPid) {
+      lastWasDesync = true;
+      break;
+    }
+  }
+
   uint8_t respMode = 0x40 | expectMode;
   for (int k = 0; k + 1 < n; k++) {
     if (bytes[k] == respMode && bytes[k + 1] == expectPid) {
       int c = 0;
       for (int m = k + 2; m < n && c < maxOut; m++) out[c++] = bytes[m];
+      lastPidOkMs = millis();       // ЭБУ жив
       return c;
     }
   }
   return 0;
 }
 
-// Медленный опрос (температура, нагрузка, дроссель, весь экран PARAMS).
-// ЭБУ примерно на каждый пятый запрос отвечает "занят" (7F 01 78). В быстром
-// queryFast01 повтор на этот случай есть, а здесь его не было: параметр
-// опрашивается редко (раз в несколько секунд), MISS_LIMIT промахов подряд
-// набирались легко — и температура с параметрами гасли в "--".
-// Потолок ожидания ЭБУ (ATST). В инициализации стоит 0x20 ~= 128 мс — этого
-// хватает быстрым PID (обороты, скорость), но температура/нагрузка/дроссель
-// на этом ЭБУ сперва отвечают "занят" (7F 01 78) и реальный ответ приходит
-// позже. ELM успевал сдаться и вернуть NO DATA до него, а повтор упирался
-// в тот же потолок. На время медленного запроса поднимаем до 0x60 ~= 384 мс.
-#define ELM_ST_FAST "20"
-#define ELM_ST_SLOW "60"
-static bool elmStSlow = false;
-static void elmSetSt(bool slow) {
-  if (slow == elmStSlow) return;
-  elmCmd(String("ATST") + (slow ? ELM_ST_SLOW : ELM_ST_FAST), 400);
-  elmStSlow = slow;
-}
+// Последний обмен по медленному PID — видно на экране PARAMS и в Serial.
+static uint8_t  slowLastPid = 0;
+static uint16_t slowLastMs  = 0;
+static char     slowLastResp[40] = "";
 
-// Кольцо последних обменов по МЕДЛЕННЫМ PID — чтобы увидеть живьём, что
-// именно отвечает адаптер на 0105/0104/0111, без ноутбука в машине: /slow.
-#define SLOWDBG_N 12
-struct SlowDbg { uint8_t pid; uint16_t ms; char resp[40]; };
-static SlowDbg slowDbg[SLOWDBG_N];
-static uint8_t slowDbgHead = 0;
-static void slowDbgAdd(uint8_t pid, uint16_t ms, const char* r) {
-  SlowDbg& d = slowDbg[slowDbgHead];
-  d.pid = pid; d.ms = ms;
-  strncpy(d.resp, r ? r : "", sizeof(d.resp) - 1);
-  d.resp[sizeof(d.resp) - 1] = 0;
-  slowDbgHead = (slowDbgHead + 1) % SLOWDBG_N;
-}
-
-bool queryPid01(uint8_t pid, uint8_t* out, int maxOut, int& cnt) {
+// ЭБУ на часть запросов отвечает "занят, ответ позже" (7F 01 78,
+// responsePending по ISO 14229). Быстрый путь (обороты/скорость) такой
+// ответ повторяет — потому они и работали. Здесь повтора не было, и все
+// параметры PARAMS оставались невалидными: n=3 ok=0 при живом обмене.
+// Таймаут медленного запроса: живой ответ приходит за 30-120 мс, ждать
+// 800 незачем — это время loop стоит и главный экран не обновляется.
+#define SLOW_TIMEOUT_MS 400
+// tries=1 на главном экране: там дорог каждый миллисекунд, повтор при
+// "занят" сам случится на следующем заходе. На PARAMS можно 3 подряд.
+bool queryPid01(uint8_t pid, uint8_t* out, int maxOut, int& cnt, int tries = 1) {
   char cmd[8];
   snprintf(cmd, sizeof(cmd), "01%02X", pid);
-  elmSetSt(true);                        // дать ЭБУ время ответить
-  for (int attempt = 0; attempt < 3; attempt++) {
-    if (attempt) delay(8);
-    uint32_t tq = millis();
-    String r = elmCmd(cmd, 700);       // > потолка ATST 0x60 (~384 мс)
-    slowDbgAdd(pid, (uint16_t)(millis() - tq), r.c_str());
+  for (int attempt = 0; attempt < tries; attempt++) {
+    if (attempt) delay(10);          // дать ЭБУ время освободиться
+    uint32_t t0 = millis();
+    String r = elmCmd(cmd, SLOW_TIMEOUT_MS);
+    slowLastPid = pid;
+    slowLastMs  = (uint16_t)(millis() - t0);
+    strncpy(slowLastResp, r.length() ? r.c_str() : "(таймаут)", sizeof(slowLastResp) - 1);
+    slowLastResp[sizeof(slowLastResp) - 1] = 0;
+
     if (screenChanged) return false;
-    if (r.isEmpty()) return false;
+    if (r.isEmpty()) {
+      Serial.printf("SLOW pid=%02X ТАЙМАУТ %u мс\n", pid, slowLastMs);
+      // Ответ на этот запрос ещё в пути и достанется следующему —
+      // выравниваем поток, иначе поедет вся дальнейшая очередь.
+      elmResync();
+      return false;
+    }
     cnt = parsePid(r, 0x01, pid, out, maxOut);
     if (cnt > 0) return true;
-    if (!lastWasPending) {               // настоящий отказ — повтор не поможет
-      dlogBadResp(r.c_str());            // образец в журнал: переживёт поездку
-      static uint32_t tBadSlow = 0;
-      if (millis() - tBadSlow >= 2000) {
-        tBadSlow = millis();
-        Serial.printf("SLOW BAD pid=%02X: [%s]\n", pid, r.c_str());
-      }
+    if (lastWasDesync) {             // ответ на чужой PID — линия съехала
+      Serial.printf("SLOW pid=%02X ЧУЖОЙ ОТВЕТ: [%s]\n", pid, r.c_str());
+      elmResync();
+      return false;
+    }
+    if (!lastWasPending) {           // настоящий отказ — повтор не поможет
+      Serial.printf("SLOW pid=%02X НЕ РАЗОБРАН %u мс: [%s]\n", pid, slowLastMs, r.c_str());
       return false;
     }
   }
-  dlogFailPending();
+  Serial.printf("SLOW pid=%02X ЭБУ занят и после повторов\n", pid);
   return false;
 }
 
@@ -376,7 +442,10 @@ bool queryPid01(uint8_t pid, uint8_t* out, int maxOut, int& cnt) {
 // и различаем причину: пустой ответ (таймаут) vs ответ есть, но не распарсен.
 static uint16_t lastRtt = 0;
 static bool     lastWasTimeout = false;
-#define FAST_TIMEOUT_MS 150
+// 150 мс оказалось мало: на экране PARAMS ТЕ ЖЕ обороты и скорость с
+// таймаутом 400 читаются стабильно, а здесь половина ответов не успевала —
+// тахометр прыгал, скорость пропадала совсем (её опрашивают вдвое реже).
+#define FAST_TIMEOUT_MS 300
 
 // Суффикс числа фреймов ("010C1") ускоряет ответ: ELM отдаёт данные сразу,
 // не дожидаясь межфреймового таймаута. НО не все клоны его понимают —
@@ -390,11 +459,10 @@ bool queryFast01(uint8_t pid, uint8_t* out, int maxOut, int& cnt) {
   if (fastSuffixOk) snprintf(cmd, sizeof(cmd), "01%02X1", pid);
   else              snprintf(cmd, sizeof(cmd), "01%02X",  pid);
 
-  elmSetSt(false);                       // быстрым PID нужен низкий потолок
   uint32_t t0 = millis();
   String r = elmCmd(cmd, FAST_TIMEOUT_MS);
   lastRtt = (uint16_t)(millis() - t0);
-  if (r.isEmpty()) { lastWasTimeout = true; return false; }
+  if (r.isEmpty()) { lastWasTimeout = true; elmResync(); return false; }
   lastWasTimeout = false;
 
   // "?" = адаптер не понял команду. Если это был запрос с суффиксом —
@@ -428,6 +496,11 @@ bool queryFast01(uint8_t pid, uint8_t* out, int maxOut, int& cnt) {
     if (lastWasPending) { dlogFailPending(); return false; }
   }
 
+  if (cnt <= 0 && lastWasDesync) {
+    elmResync();                          // ответы съехали — выровнять поток
+    return false;
+  }
+
   if (cnt <= 0) {
     dlogBadResp(r.c_str());               // образец в лог (переживёт поездку)
     static uint32_t tBad = 0;
@@ -439,16 +512,37 @@ bool queryFast01(uint8_t pid, uint8_t* out, int maxOut, int& cnt) {
   return cnt > 0;
 }
 
+// Мультизапрос: одна команда "01 <p1><p2>..." -> один ответ со всеми PID.
+// ELM327 (и большинство клонов) поддерживают до 6 PID в запросе.
+// lastMultiOk = сработал ли мультирежим (иначе откат на поштучный опрос).
+static bool lastMultiOk = true;
+String queryMulti(const uint8_t* pids, int npid) {
+  char cmd[24] = "01";
+  for (int i = 0; i < npid && i < 6; i++)
+    sprintf(cmd + strlen(cmd), "%02X", pids[i]);
+  return elmCmd(cmd, 900);
+}
 
 // ============================================================
 // ОПРОС — мелкими быстрыми запросами (по одному PID)
 // ============================================================
 // счётчики промахов: значение гасим только после MISS_LIMIT неудач подряд,
 // иначе держим последнее — так одиночные тайм-ауты не рисуют «пустые полосы»
+// Сколько терпеть полное молчание ЭБУ при живом адаптере, прежде чем
+// переинициализировать протокол. 6 с: обычный опрос идёт ~12 Гц, так что
+// это заведомо не единичные промахи.
+#define ELM_STALE_MS 6000
 #define MISS_LIMIT 5
 static uint8_t missRpm, missSpd, missCool, missLoad, missThr, missVolt;
 static void bumpMiss(uint8_t& m, int& val, int deadVal) {
   if (++m >= MISS_LIMIT) { m = MISS_LIMIT; val = deadVal; }
+}
+// Медленные значения (температура, нагрузка, дроссель) опрашиваются раз в
+// 4.8 с. При пороге 5 они гасли уже после 24 с редких "ЭБУ занят", хотя
+// данные в целом идут. Держим их дольше — пропасть должно только всерьёз.
+#define SLOW_MISS_LIMIT 15
+static void bumpMissSlow(uint8_t& m, int& val, int deadVal) {
+  if (++m >= SLOW_MISS_LIMIT) { m = SLOW_MISS_LIMIT; val = deadVal; }
 }
 
 // KINGBOLEN не понял мультизапрос -> опрашиваем поштучно, но РАЗДЕЛЬНО:
@@ -470,31 +564,101 @@ void pollRpm() {
 void pollSpeed() {
   uint8_t b[8]; int c;
   if (queryFast01(0x0D, b, 8, c) && c >= 1) { obd.speed = b[0]; missSpd = 0; }
-  else bumpMiss(missSpd, obd.speed, -1);
+  else bumpMissSlow(missSpd, obd.speed, -1);   // опрашивается через раз — терпим дольше
 }
 
 // оставлено для alert-оверлея: RPM+скорость за раз
 void pollFast() { pollRpm(); pollSpeed(); }
 
 // МЕДЛЕННОЕ: один параметр за вызов, по кругу (темп/нагрузка/дроссель/вольты).
+// ------------------------------------------------------------
+// РАСХОД ТОПЛИВА
+// Прямого PID "л/100 км" в стандарте нет. Считаем из расхода топлива и
+// скорости: л/100км = (л/ч) / (км/ч) * 100.
+// Литры в час берём двумя путями:
+//   - PID 015E (fuel rate) — если ЭБУ его отдаёт, это точное значение;
+//   - иначе из расхода воздуха MAF: топливо = MAF / 14.7 (стехиометрия),
+//     г/с -> л/ч через плотность бензина 0.745 кг/л.
+// Второй путь приблизительный (не учитывает коррекции смеси), но MAF есть
+// почти везде, а 015E — далеко не всегда.
+// ------------------------------------------------------------
+#define FUEL_AFR      14.7f     // стехиометрия для бензина
+#define FUEL_DENSITY  0.745f    // кг/л
+#define FUEL_MIN_KMH  5         // ниже — на 100 км не пересчитываем
+
+static float fuelLph = -1;              // мгновенный расход, л/ч
+static bool  fuelRatePidOk = false;     // ЭБУ отдаёт PID 015E
+static double tripLiters = 0, tripKm = 0;   // накопление за поездку
+static uint32_t tripLastMs = 0;
+
+static void fuelAccumulate() {
+  uint32_t now = millis();
+  if (tripLastMs == 0) { tripLastMs = now; return; }
+  uint32_t dt = now - tripLastMs;
+  tripLastMs = now;
+  if (dt > 5000) return;                // была пауза — этот кусок не копим
+  if (fuelLph > 0)   tripLiters += fuelLph * (dt / 3600000.0);
+  if (obd.speed > 0) tripKm     += obd.speed * (dt / 3600000.0);
+}
+
+// л/100 км сейчас; -1 если считать нельзя (стоим или нет данных)
+static float fuelPer100() {
+  if (fuelLph < 0 || obd.speed < FUEL_MIN_KMH) return -1;
+  return fuelLph / obd.speed * 100.0f;
+}
+static float fuelPer100Avg() {
+  if (tripKm < 0.1) return -1;
+  return (float)(tripLiters / tripKm * 100.0);
+}
+
 void pollSlowStep() {
   static uint8_t idx = 0;
   uint8_t b[8]; int c;
   switch (idx) {
     case 0:
-      if (queryPid01(0x05, b, 8, c) && c >= 1) { obd.coolant = b[0] - 40; missCool = 0; } else bumpMiss(missCool, obd.coolant, -999);
+      if (queryPid01(0x05, b, 8, c) && c >= 1) { obd.coolant = b[0] - 40; missCool = 0; } else bumpMissSlow(missCool, obd.coolant, -999);
       break;
     case 1:
-      if (queryPid01(0x04, b, 8, c) && c >= 1) { obd.load = b[0] * 100 / 255; missLoad = 0; } else bumpMiss(missLoad, obd.load, -1);
+      if (queryPid01(0x04, b, 8, c) && c >= 1) { obd.load = b[0] * 100 / 255; missLoad = 0; } else bumpMissSlow(missLoad, obd.load, -1);
       break;
     case 2:
-      if (queryPid01(0x11, b, 8, c) && c >= 1) { obd.throttle = b[0] * 100 / 255; missThr = 0; } else bumpMiss(missThr, obd.throttle, -1);
+      if (queryPid01(0x11, b, 8, c) && c >= 1) { obd.throttle = b[0] * 100 / 255; missThr = 0; } else bumpMissSlow(missThr, obd.throttle, -1);
       break;
     case 3:
       pollVoltage();
       break;
+    case 4:
+      pollFuel();
+      break;
   }
-  idx = (idx + 1) % 4;
+  idx = (idx + 1) % 5;
+}
+
+// Источник расхода: сперва пробуем штатный PID 015E (литры в час).
+// Если ЭБУ его не знает — считаем из расхода воздуха (MAF, PID 0110).
+void pollFuel() {
+  uint8_t b[8]; int c;
+
+  if (fuelRatePidOk || fuelLph < 0) {
+    if (queryPid01(0x5E, b, 8, c) && c >= 2) {
+      fuelLph = (((b[0] << 8) | b[1]) * 0.05f);
+      fuelRatePidOk = true;
+      fuelAccumulate();
+      return;
+    }
+    // один раз выяснили, что 015E не поддержан — больше не спрашиваем
+    if (!fuelRatePidOk) {
+      static bool told = false;
+      if (!told) { told = true; Serial.println("PID 015E нет -> считаем расход по MAF"); }
+    }
+  }
+
+  if (queryPid01(0x10, b, 8, c) && c >= 2) {
+    float mafGs = (((b[0] << 8) | b[1]) / 100.0f);          // г/с воздуха
+    // топливо г/с -> кг/ч -> л/ч
+    fuelLph = (mafGs / FUEL_AFR) * 3.6f / FUEL_DENSITY;
+    fuelAccumulate();
+  }
 }
 
 // ============================================================
@@ -524,6 +688,22 @@ void pollDemo() {
   obd.voltage  = 14.1f + sinf(t / 3000.0f) * 0.3f;
   obd.linkUp   = true;
   missRpm = missSpd = missCool = missLoad = missThr = missVolt = 0;
+
+  // Прокрутка кодов раз в 5 с — чтобы проверить расшифровки на экране
+  // (и их перенос) без реальной неисправности в машине.
+  static uint32_t tDemoDtc = 0;
+  static uint8_t  demoDtcIdx = 0;
+  if (millis() - tDemoDtc >= 5000) {
+    tDemoDtc = millis();
+    demoDtcIdx++;
+    int n = sizeof(DTC_TABLE) / sizeof(DTC_TABLE[0]);
+    char code[8];
+    strncpy_P(code, DTC_TABLE[demoDtcIdx % n].code, sizeof(code) - 1);
+    code[sizeof(code) - 1] = 0;
+    dtcList  = code;
+    dtcValid = true;
+    dirtyFull = true;            // перерисовать экран кодов
+  }
 }
 
 // только RPM+скорость (для экрана ACCEL — нужна быстрая скорость)
@@ -545,19 +725,51 @@ void pollVoltage() {
 
 // Опрос одного параметра из каталога PID_DEFS по индексу.
 // При промахе держим прежнее значение MISS_LIMIT раз, потом гасим.
+// Ячейка PARAMS опрашивается по кругу, то есть редко. Гасить её после 5
+// промахов слишком строго: пара ответов "ЭБУ занят" обнуляла весь экран.
+#define PARAM_MISS_LIMIT 12
 static uint8_t pidMiss[PID_DEFS_LEN];
 void pollOneParam(int idx) {
   if (idx < 0 || idx >= PID_DEFS_LEN) return;
   const PidDef& d = PID_DEFS[idx];
   PidRaw raw; raw.n = 0;
   uint8_t b[8]; int c = 0;
-  if (queryPid01(d.pid, b, 6, c) && c > 0) {
+
+  // mode 0xFE = не запрос к ЭБУ, а ВЫЧИСЛЯЕМОЕ значение (расход на 100 км).
+  if (d.mode == 0xFE) {
+    float v = (d.pid == 0x01) ? fuelPer100() : fuelPer100Avg();
+    uint16_t hv = (v < 0) ? 9999 : (uint16_t)(v * 100.0f + 0.5f);
+    if (hv > 9999) hv = 9999;             // 9999 = "считать нельзя"
+    raw.b[0] = hv >> 8; raw.b[1] = hv & 0xFF; raw.n = 2;
+    pidVals[idx] = d.decode(raw);
+    pidMiss[idx] = 0;
+    return;
+  }
+
+  // mode 0xFF = не PID, а команда самого адаптера (ATRV).
+  if (d.mode == 0xFF) {
+    String rv = elmCmd("ATRV", 400);
+    rv.toUpperCase(); rv.replace("V", ""); rv.trim();
+    float v = rv.toFloat();
+    if (v > 5.0 && v < 20.0) {
+      uint16_t hv = (uint16_t)(v * 100.0f + 0.5f);   // сотые вольта
+      raw.b[0] = hv >> 8; raw.b[1] = hv & 0xFF; raw.n = 2;
+      pidVals[idx] = d.decode(raw);
+      pidMiss[idx] = 0;
+    } else if (++pidMiss[idx] >= PARAM_MISS_LIMIT) {
+      pidMiss[idx] = PARAM_MISS_LIMIT;
+      pidVals[idx] = bad();
+    }
+    return;
+  }
+
+  if (queryPid01(d.pid, b, 6, c, 3) && c > 0) {
     for (int i = 0; i < c && i < 6; i++) raw.b[i] = b[i];
     raw.n = c;
     pidVals[idx] = d.decode(raw);
     pidMiss[idx] = 0;
-  } else if (++pidMiss[idx] >= MISS_LIMIT) {
-    pidMiss[idx] = MISS_LIMIT;
+  } else if (++pidMiss[idx] >= PARAM_MISS_LIMIT) {
+    pidMiss[idx] = PARAM_MISS_LIMIT;
     pidVals[idx] = bad();
   }
 }
@@ -633,7 +845,7 @@ void savePidMask() {
 // ============================================================
 String webPage() {
   String h = F("<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
-               "<style>body{font:16px/1.5 sans-serif;margin:16px;background:#111;color:#eee}"
+               "<style>body{font:16px/1.5 sans-serif;margin:16px;background:#111;color:#eee;padding-bottom:40vh}"
                "h1{font-size:18px}label{display:block;padding:6px 0;border-bottom:1px solid #333}"
                "input{transform:scale(1.4);margin-right:12px}"
                "button{margin-top:16px;padding:10px 24px;font-size:16px;background:#2a7;color:#fff;border:0;border-radius:6px}"
@@ -723,10 +935,35 @@ String webPage() {
     h += (accelBest.t[i] > 0 ? String(accelBest.t[i], 1) + " с" : String("--"));
     h += "<br>";
   }
-  h += F("</p><form method=POST action=/accelreset>"
+  h += F("</p><form method=POST action=/screens>"
+         "<label><input type=checkbox name=accel");
+  if (accelScreenOn) h += F(" checked");
+  h += F("> показывать экран разгона</label> "
+         "<button type=submit>Сохранить</button></form>"
+         "<form method=POST action=/accelreset>"
          "<button style=background:#a33>Сбросить рекорды разгона</button></form>");
 
   // --- демо-режим ---
+  // Кнопка выхода из режима настройки — показываем только когда в нём и
+  // находимся: в обычной работе она бессмысленна.
+  if (setupActive) {
+    h += F("<h1 style=margin-top:28px>Режим настройки</h1>"
+           "<p>Плата раздаёт свою точку доступа, опрос машины остановлен.</p>"
+           "<form method=POST action=/exitsetup>"
+           "<button type=submit style=background:#27a>Выйти в обычный режим</button>"
+           "</form>");
+  }
+
+  // --- журнал поездки ---
+  h += F("<h1 style=margin-top:28px>Журнал</h1>");
+  h += "<p>Записей: <b>" + String(dlog.count) + "</b> из " + String(LOG_SLOTS);
+  h += ", аномалий: <b>" + String(dlog.evCount) + "</b>";
+  h += ", перезагрузок: <b>" + String(dlog.boots) + "</b></p>";
+  h += F("<p><a href=/log.csv>Скачать журнал (CSV)</a><br>"
+         "<a href=/log>Посмотреть в браузере</a></p>"
+         "<form method=POST action=/logclear>"
+         "<button style=background:#a33>Очистить журнал</button></form>");
+
   h += F("<h1 style=margin-top:28px>Демо</h1><form method=POST action=/demo>");
   h += String("<p>Сейчас: <b>") + (demoOn ? "ВКЛ" : "выкл") + "</b></p>";
   h += F("<button type=submit>Переключить демо-режим</button></form>");
@@ -750,23 +987,6 @@ void webBegin() {
              F("<meta http-equiv=refresh content='1;url=/'>Сохранено."));
   });
   // Лог замеров текстом: и с телефона в setup-режиме, и с компа по /log
-  // Живой срез медленного опроса: что реально отвечает адаптер на 0105 и т.д.
-  web.on("/slow", []() {
-    String s = "pid\tms\tresp\n";
-    s.reserve(1024);
-    for (int i = 0; i < SLOWDBG_N; i++) {
-      const SlowDbg& d = slowDbg[(slowDbgHead + i) % SLOWDBG_N];
-      if (!d.pid && !d.resp[0]) continue;
-      char line[80];
-      snprintf(line, sizeof(line), "%02X\t%u\t[%s]\n", d.pid, d.ms, d.resp);
-      s += line;
-    }
-    s += "\nATST slow="; s += (elmStSlow ? "yes" : "no");
-    s += "  coolant="; s += obd.coolant;
-    s += "  load="; s += obd.load;
-    s += "  thr="; s += obd.throttle;
-    web.send(200, "text/plain; charset=utf-8", s);
-  });
   web.on("/log", []() {
     String s = "sec\thz\tfails\ttouts\tpend\trtt_avg\trtt_min\trtt_max\trpm_max\tspd_max\tlink\n";
     s.reserve(2048);
@@ -784,6 +1004,47 @@ void webBegin() {
   });
   // Сохранённые WiFi-сети. Слот 0 — сеть OBD-адаптера (приоритет),
   // слоты 1..3 — запасные (дом/работа) для OTA и веб-морды.
+  // Выгрузка журнала ФАЙЛОМ (CSV). Content-Disposition заставляет браузер
+  // и телефон сохранить, а не показать. Разделитель ';' — Excel на русской
+  // локали открывает такой файл сразу по столбцам, без импорта.
+  web.on("/log.csv", []() {
+    String s;
+    s.reserve(4096);
+    s  = "# OBD Dash "; s += FW_VERSION;
+    s += "; boots="; s += dlog.boots;
+    s += "; suffix_off="; s += dlog.suffixOff;
+    s += "\r\n# bad1=["; s += dlog.badResp[0]  ? dlog.badResp  : "-";
+    s += "] bad2=[";      s += dlog.badResp2[0] ? dlog.badResp2 : "-";
+    s += "]\r\n";
+    s += "sec;hz;fails;touts;pend;rtt_avg;rtt_min;rtt_max;rpm_max;spd_max;link;ap;apcli;rssi\r\n";
+
+    int start = (dlog.count < LOG_SLOTS) ? 0 : dlog.head;
+    for (int i = 0; i < dlog.count; i++) {
+      const LogSlot& sl = dlog.slot[(start + i) % LOG_SLOTS];
+      char line[140];
+      snprintf(line, sizeof(line),
+               "%u;%.1f;%u;%u;%u;%u;%u;%u;%u;%u;%u;%u;%u;%d\r\n",
+               sl.sec, sl.polls / 10.0f, sl.fails, sl.touts, sl.pend,
+               sl.rttAvg, sl.rttMin, sl.rttMax, sl.rpmMax, sl.spdMax,
+               (sl.flags & 1) ? 1 : 0, (sl.flags & 2) ? 1 : 0,
+               sl.apClients, sl.rssi);
+      s += line;
+    }
+
+    s += "\r\n# аномалии (";  s += dlog.evCount; s += ")\r\n";
+    s += "sec;событие;значение\r\n";
+    for (int i = 0; i < dlog.evCount; i++) {
+      const LogEvent& e = dlog.ev[i];
+      char line[100];
+      snprintf(line, sizeof(line), "%u;%s;%d\r\n",
+               e.sec, dlogEventName(e.kind), e.val);
+      s += line;
+    }
+
+    web.sendHeader("Content-Disposition", "attachment; filename=obd-log.csv");
+    web.send(200, "text/csv; charset=utf-8", s);
+  });
+
   web.on("/nets", HTTP_POST, []() {
     for (int i = 0; i < NET_MAX; i++) {
       String ks = "s" + String(i), kp = "p" + String(i);
@@ -816,13 +1077,18 @@ void webBegin() {
              F("<meta http-equiv=refresh content='1;url=/'>OK"));
   });
 
-  web.on("/screens", HTTP_POST, []() {
-    accelScreenOn = web.hasArg("accel");
-    brightSave(prefs);                    // флаг лежит рядом с яркостью
-    // если сейчас на скрытом экране — уйти на главный
-    if (!screenVisible(currentScreen)) { currentScreen = SCREEN_GAUGE; dirtyFull = true; }
+  // Выход из режима настройки без кнопки и без перезагрузки: ставим флаг,
+  // его увидит цикл enterSetupMode() и корректно свернёт AP, подняв STA.
+  web.on("/exitsetup", HTTP_POST, []() {
+    setupExitReq = true;
     web.send(200, "text/html; charset=utf-8",
-             F("<meta http-equiv=refresh content='1;url=/'>OK"));
+             F("<meta name=viewport content='width=device-width,initial-scale=1'>"
+               "<style>body{font:16px sans-serif;margin:16px;background:#111;color:#eee}</style>"
+               "<h1>Выхожу из режима настройки</h1>"
+               "<p>Точка доступа сейчас погаснет — это нормально, "
+               "телефон отключится от неё сам.</p>"
+               "<p>Плата вернётся к обычной работе и подключится "
+               "к сети адаптера.</p>"));
   });
 
   web.on("/logclear", HTTP_POST, []() {
@@ -852,6 +1118,15 @@ void webBegin() {
     web.send(200, "text/html; charset=utf-8",
              F("<meta http-equiv=refresh content='1;url=/'>Пороги сохранены."));
   });
+  web.on("/screens", HTTP_POST, []() {
+    accelScreenOn = web.hasArg("accel");
+    brightSave(prefs);                    // флаг лежит рядом с яркостью
+    // если сейчас на скрытом экране — уйти на главный
+    if (!screenVisible(currentScreen)) { currentScreen = SCREEN_GAUGE; dirtyFull = true; }
+    web.send(200, "text/html; charset=utf-8",
+             F("<meta http-equiv=refresh content='1;url=/'>OK"));
+  });
+
   web.on("/accelreset", HTTP_POST, []() {
     accelReset(prefs);
     web.send(200, "text/html; charset=utf-8",
@@ -859,6 +1134,7 @@ void webBegin() {
   });
   web.on("/demo", HTTP_POST, []() {
     demoOn = !demoOn;
+    brightSave(prefs);          // флаг демо тоже переживает перезагрузку
     dirtyFull = true;
     web.send(200, "text/html; charset=utf-8",
              F("<meta http-equiv=refresh content='1;url=/'>OK"));
@@ -868,7 +1144,7 @@ void webBegin() {
   web.on("/ota", HTTP_GET, []() {
     web.send(200, "text/html; charset=utf-8",
       F("<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
-        "<style>body{font:16px sans-serif;margin:16px;background:#111;color:#eee}"
+        "<style>body{font:16px sans-serif;margin:16px;background:#111;color:#eee;padding-bottom:40vh}"
         "button{padding:10px 24px;font-size:16px;background:#2a7;color:#fff;border:0;border-radius:6px;margin-top:10px}"
         "a{color:#2a7}</style>"
         "<h1>Обновление прошивки</h1>"
@@ -1123,15 +1399,16 @@ void elmService() {
       elmCmd("ATS0", 400);   if (screenChanged) break;   // пробелы off
       elmCmd("ATH0", 400);   if (screenChanged) break;   // заголовки off
       elmCmd("ATAT1", 400);  if (screenChanged) break;   // адаптивный тайминг
-      elmCmd("ATST" ELM_ST_FAST, 400); if (screenChanged) break;  // потолок ожидания ЭБУ ~128 мс
-      elmStSlow = false;     // ATZ сбросил настройки — кэш потолка тоже
+      elmCmd("ATST20", 400); if (screenChanged) break;   // потолок ожидания ЭБУ = 0x20*4 ≈ 128 мс (по умолч. ~200)
       elmCmd("ATCAF1", 400); if (screenChanged) break;   // авто-формат CAN
       // жёстко ISO 15765 500k 11-bit (почти все машины 2008+) — без авто-детекта
       elmCmd("ATSP6", 400);  if (screenChanged) break;
+      lastMultiOk = true;                                 // пробуем мультизапрос заново
       String r = elmCmd("0100", 1500);
       if (r.indexOf("41") >= 0 || r.indexOf("SEARCHING") >= 0) {
         Serial.println("ELM ready (SP6)");
         obd.linkUp = true;
+        lastPidOkMs = millis();
         elmState = ELM_READY;
       } else {
         // SP6 не подошёл — откат на авто-детект
@@ -1140,6 +1417,7 @@ void elmService() {
         if (r2.indexOf("41") >= 0 || r2.indexOf("SEARCHING") >= 0) {
           Serial.println("ELM ready (SP0 auto)");
           obd.linkUp = true;
+          lastPidOkMs = millis();
           elmState = ELM_READY;
         } else {
           Serial.println("ELM no bus, retry init");
@@ -1160,6 +1438,23 @@ void elmService() {
       // TCP: клоны иногда «моргают» connected() — не рвём сразу,
       // терпим до 3 подряд неудачных проверок. Проверяем раз в 500 мс:
       // connected() — системный вызов, на горячем пути опроса он лишний.
+      // Сторож сессии с ЭБУ: связь с адаптером есть, а данных нет дольше
+      // ELM_STALE_MS — значит сессия протухла (обычно после перезапуска
+      // двигателя). Переинициализируем протокол, не трогая WiFi.
+      if (lastPidOkMs && millis() - lastPidOkMs > ELM_STALE_MS) {
+        // при заглушенной машине это повторяется — не спамим
+        static uint32_t tStaleLog = 0;
+        if (millis() - tStaleLog >= 30000) {
+          tStaleLog = millis();
+          Serial.println("ЭБУ молчит -> переинициализация протокола");
+          dlogEvent(EV_LINKLOST, 1);
+        }
+        lastPidOkMs = millis();        // дать новой попытке полный интервал
+        obd.linkUp = false;
+        elmState = ELM_INIT;
+        break;
+      }
+
       static uint8_t  tcpMiss = 0;
       static uint32_t tLink = 0;
       if (millis() - tLink >= 500) {
@@ -1212,8 +1507,13 @@ static uint16_t tachColor(int rpm) {
 
 // Сегмент как сплошная трапеция: две пары треугольников + заливка щелей
 // дуговыми линиями. Без просветов на любом радиусе.
-static void tachDrawSeg(int seg, uint16_t col) {
-  const float frac = 1.0f;
+// frac (0..1] — какая доля сегмента залита, для плавного «дорастания»
+// последнего деления. Именно это даёт видимую плавность: раньше
+// интерполировалось только значение, а рисовалось всё равно целыми
+// сегментами по 250 об/мин, поэтому между делениями картинка не менялась.
+static void tachDrawSegF(int seg, uint16_t col, float frac) {
+  if (frac <= 0.0f) return;
+  if (frac > 1.0f) frac = 1.0f;
   float base = TACH_A_START + TACH_A_SPAN * seg / (float)TACH_NSEG;
   float full = TACH_A_SPAN / (float)TACH_NSEG;
   float a0 = base + TACH_GAP_DEG;
@@ -1236,6 +1536,7 @@ static void tachDrawSeg(int seg, uint16_t col) {
 }
 
 // целый сегмент — частый случай
+static void tachDrawSeg(int seg, uint16_t col) { tachDrawSegF(seg, col, 1.0f); }
 
 // СТИРАНИЕ сегмента — той же формой, что заливка, плюс небольшой запас
 // по углу и радиусу. Сегменты рисуются только целиком, поэтому геометрия
@@ -1263,11 +1564,16 @@ static void tachEraseSeg(int seg) {
   }
 }
 
-// ---- Плавная дуга ----------------------------------------------------
-// Значение сглаживается (tachTick), рисуется всегда целыми сегментами:
-// fillTriangle при разных углах даёт разный растр, поэтому частично
-// залитый сегмент нельзя стереть «в ноль» — оставались бы точки.
-// Единственная точка отрисовки — tachRender.
+// ---- Плавная дуга -----------------------------------------------------
+// Что было не так в прошлой попытке:
+//  1) сглаживалось только ЗНАЧЕНИЕ, а рисовалось целыми сегментами по
+//     250 об/мин — между делениями картинка не менялась вовсе, дуга
+//     дёргалась так же, только с запозданием;
+//  2) drawTachAnim() рисовал дугу из одной ветки цикла, а drawGaugeValues()
+//     из другой звал drawTach(obd.rpm) с сырым значением — две функции
+//     спорили за одну дугу разными числами, отсюда «кривое» отображение.
+// Решение: ЕДИНСТВЕННАЯ точка отрисовки (tachRender), сглаженное значение
+// хранится в одном месте, а последний сегмент рисуется ДРОБНО.
 
 
 // ---- ДЕЛЕНИЯ В ПОЛОСЕ ДУГИ ----------------------------------------
@@ -1367,27 +1673,16 @@ static void tachTick() {
 // изменились — иначе не трогает пиксели (нет мелькания при том же значении).
 // id — уникальный номер поля 0..FIELD_MAX-1.
 #define FIELD_MAX 16
-#define FIELD_TEXT_MAX 12
-// Буфер вместо String: fieldId зовётся 5 раз за кадр, а временный String
-// на каждый вызов — это выделение кучи в горячем пути отрисовки.
-struct FieldCache { char s[FIELD_TEXT_MAX]; uint16_t col; uint8_t size; bool init; };
+struct FieldCache { String s; uint16_t col; uint8_t size; bool init; };
 static FieldCache fcache[FIELD_MAX];
 
-static void fieldId(int id, int x, int y, int w, int h, const char* s,
+static void fieldId(int id, int x, int y, int w, int h, const String& s,
                     uint16_t col, uint8_t size) {
-  if (id < 0 || id >= FIELD_MAX) return;
-  // c_str() у пустого String на ESP32 возвращает nullptr (буфер не выделен),
-  // а не "". Без этой подстраховки strcmp/drawString падают на первом же
-  // ещё не декодированном параметре — экран PARAMS оставался пустым.
-  if (!s) s = "--";
   FieldCache& c = fcache[id];
-  if (c.init && c.col == col && c.size == size && strcmp(c.s, s) == 0) return;
+  if (c.init && c.s == s && c.col == col && c.size == size) return;   // не изменилось
 
-  size_t oldLen = c.init ? strlen(c.s) : 0;
-  bool sameLayout = c.init && c.size == size && oldLen == strlen(s);
-  strncpy(c.s, s, FIELD_TEXT_MAX - 1);
-  c.s[FIELD_TEXT_MAX - 1] = 0;
-  c.col = col; c.size = size; c.init = true;
+  bool sameLayout = c.init && c.size == size && c.s.length() == s.length();
+  c.s = s; c.col = col; c.size = size; c.init = true;
 
   lcd.setTextDatum(middle_center);
   lcd.setTextSize(size);
@@ -1397,8 +1692,11 @@ static void fieldId(int id, int x, int y, int w, int h, const char* s,
     lcd.drawString(s, x + w / 2, y + h / 2);
   } else {
     // Длина или размер изменились — чистим зону и рисуем.
-    // Запас вверх обязателен: крупный шрифт выше зоны и при возврате
-    // к меньшему размеру оставлял бы верхушки букв.
+    // Запас по вертикали обязателен: крупный шрифт (size 4 = ~32 px)
+    // выше зоны h=30, поэтому при возврате к меньшему размеру от него
+    // оставались верхушки букв (красные полоски над температурой).
+    // Запас только ВВЕРХ: снизу на y+h+5 уже стоят подписи (TEMP/BATT),
+    // их затирать нельзя. Крупный шрифт вылезает именно вверх.
     lcd.fillRect(x, y - 7, w, h + 8, TFT_BLACK);
     lcd.setTextColor(col);
     lcd.drawString(s, x + w / 2, y + h / 2);
@@ -1499,24 +1797,25 @@ void drawGaugeValues() {
   fieldId(1, 60, 62, 64, 34, b, TFT_CYAN, 4);
 
   // --- передача (справа) ---
-  char g[4]; uint16_t gcol;
-  if      (gearCurrent > 0)   { g[0] = '0' + gearCurrent; g[1] = 0; gcol = TFT_WHITE; }
-  else if (gearCalibrating)   { strcpy(g, "c"); gcol = TFT_ORANGE; }
-  else if (gears.count == 0)  { strcpy(g, "-"); gcol = TFT_DARKGREY; }
-  else                        { strcpy(g, "N"); gcol = TFT_DARKGREY; }
+  String g; uint16_t gcol;
+  if      (gearCurrent > 0)   { g = String(gearCurrent); gcol = TFT_WHITE; }
+  else if (gearCalibrating)   { g = "c"; gcol = TFT_ORANGE; }
+  else if (gears.count == 0)  { g = "-"; gcol = TFT_DARKGREY; }
+  else                        { g = "N"; gcol = TFT_DARKGREY; }
   fieldId(2, 128, 62, 64, 34, g, gcol, 4);
 
-  // --- температура ОЖ (слева): >95 красным крупнее, иначе зелёным ---
-  bool overheat = (obd.coolant > 95);
+  // --- температура ОЖ ---
+  // Синий — не прогрелась (<50), зелёный — рабочая (50..98), красный — выше.
   uint16_t tcol = (obd.coolant <= -200) ? TFT_DARKGREY
-                : overheat ? TFT_RED : TFT_GREEN;
+                : (obd.coolant >= 98)   ? TFT_RED
+                : (obd.coolant < 50)    ? TFT_CYAN
+                                        : TFT_GREEN;
   if (obd.coolant > -200) snprintf(b, sizeof(b), "%d\xF8" "C", obd.coolant);
   else                    snprintf(b, sizeof(b), "--\xF8" "C");
-  // Перегрев показываем ТОЛЬКО красным цветом, без укрупнения шрифта:
-  // "120C" размером 4 требует 96 px, а зона внутри круга даёт 92 —
-  // шире сделать нельзя, иначе цифры делений на дуге налезают на поле.
-  // Потеря невелика: перегрев и так поднимает полноэкранную тревогу.
-  fieldId(3, 74, 156, 92, 26, b, tcol, 3);
+  // Размер 4: "105 C" это 120 px при высоте 32, на y=153..185 круг
+  // (R=98) даёт больше — влезает с запасом. Зону расширяем до 124 px,
+  // иначе широкое значение обрезалось бы рамкой поля, а не экраном.
+  fieldId(3, 58, 153, 124, 32, b, tcol, 4);
 
   // --- напряжение АКБ (справа) ---
   uint16_t vcol = TFT_WHITE;
@@ -1540,11 +1839,12 @@ static bool paramsStaticDrawn = false;
 // 2 колонки x до 4 строк, всё в центральном квадрате (круглый экран
 // режет углы). Ячейка: подпись мелко сверху, значение крупно снизу.
 // Колонки по центрам X = 68 и 172, строки Y от 58 с шагом 42.
-#define PCOL_L   68
-#define PCOL_R   172
-#define PROW_Y0  58
-#define PROW_DY  42
-#define PCELL_W  92
+// Три параметра в столбик, во всю ширину круга: значение максимально
+// крупно, подпись мелко над ним. Больше трёх на 240 px крупно не влезет.
+#define PARAM_SHOW   3            // сколько параметров показываем
+#define PROW_Y0      66           // центр значения первой строки
+#define PROW_DY      54           // шаг между строками
+#define PCELL_W      200
 
 void drawParamsStatic() {
   lcd.fillScreen(TFT_BLACK);
@@ -1560,37 +1860,47 @@ void drawParamsStatic() {
   paramsStaticDrawn = true;
 }
 
+// Самый крупный шрифт, при котором строка из n символов влезает в круг
+// на высоте cy. Радиус 98 — внутренняя граница дуги; глиф size = 6*size
+// в ширину и 8*size в высоту.
+static uint8_t paramFontFor(int cy, int n) {
+  for (int sz = 6; sz >= 2; sz--) {
+    int gw = 6 * sz, gh = 8 * sz;
+    float dTop = (float)(cy - gh / 2 - 120);
+    float dBot = (float)(cy + gh / 2 - 120);
+    float wTop = sqrtf(fmaxf(98.0f * 98.0f - dTop * dTop, 0.0f));
+    float wBot = sqrtf(fmaxf(98.0f * 98.0f - dBot * dBot, 0.0f));
+    float half = fminf(wTop, wBot);
+    if (n * gw <= 2 * half) return sz;
+  }
+  return 2;
+}
+
 void drawParamsValues() {
-  int rows[8], nr = 0;
-  for (int i = 0; i < PID_DEFS_LEN && nr < 8; i++)
+  int rows[PARAM_SHOW], nr = 0;
+  for (int i = 0; i < PID_DEFS_LEN && nr < PARAM_SHOW; i++)
     if (pidMask & (1u << i)) rows[nr++] = i;
-
   for (int k = 0; k < nr; k++) {
-    int i = rows[k];
-    int cx = (k % 2) ? PCOL_R : PCOL_L;
-    int cy = PROW_Y0 + (k / 2) * PROW_DY;
-
-    // подпись — статична, рисуем один раз (в drawParamsStatic не рисуется,
-    // т.к. набор меняется; ставим через fieldId со своим id-диапазоном)
-    PidVal& v = pidVals[i];
-    // значение с кэшем: id = 5 + k (0..4 занял GAUGE)
-    fieldId(5 + k, cx - PCELL_W / 2, cy - 2, PCELL_W, 22,
-            v.valid ? v.text.c_str() : "--",
-            v.valid ? v.color : C_GREY, 2);
+    const PidVal& v = pidVals[rows[k]];
+    String txt = v.valid ? v.text : String("--");
+    int cy = PROW_Y0 + k * PROW_DY;
+    uint8_t sz = paramFontFor(cy, txt.length());
+    int h = 8 * sz;
+    fieldId(5 + k, 120 - PCELL_W / 2, cy - h / 2, PCELL_W, h, txt,
+            v.valid ? v.color : C_GREY, sz);
   }
 }
 
 // подписи параметров (статика PARAMS) — рисуются при полной перерисовке
 void drawParamsLabels() {
   int nr = 0;
-  for (int i = 0; i < PID_DEFS_LEN && nr < 8; i++) {
+  for (int i = 0; i < PID_DEFS_LEN && nr < PARAM_SHOW; i++) {
     if (!(pidMask & (1u << i))) continue;
-    int cx = (nr % 2) ? PCOL_R : PCOL_L;
-    int cy = PROW_Y0 + (nr / 2) * PROW_DY;
+    int cy = PROW_Y0 + nr * PROW_DY;
     lcd.setTextDatum(middle_center);
     lcd.setTextColor(TFT_DARKGREY);
     lcd.setTextSize(1);
-    lcd.drawString(PID_DEFS[i].label, cx, cy - 10);
+    lcd.drawString(PID_DEFS[i].label, 120, cy - 24);
     nr++;
   }
 }
@@ -1606,10 +1916,39 @@ void drawParams() {
 // ------------------------------------------------------------
 // ЭКРАН КОДОВ (по кнопке)
 // ------------------------------------------------------------
+// Длина строки в СИМВОЛАХ (UTF-8), а не в байтах.
+static int utf8Len(const String& s) {
+  int n = 0;
+  for (int i = 0; i < (int)s.length(); i++)
+    if ((s[i] & 0xC0) != 0x80) n++;
+  return n;
+}
+// Байтовый индекс начала n-го символа.
+static int utf8Idx(const String& s, int nchars) {
+  int n = 0, i = 0;
+  for (; i < (int)s.length(); i++) {
+    if ((s[i] & 0xC0) != 0x80) {
+      if (n == nchars) return i;
+      n++;
+    }
+  }
+  return s.length();
+}
+// Перенос по пробелу, но не дальше maxChars символов.
+static void utf8Wrap(const String& src, int maxChars, String& a, String& b) {
+  if (utf8Len(src) <= maxChars) { a = src; b = ""; return; }
+  int cut = utf8Idx(src, maxChars);
+  int sp = src.lastIndexOf(' ', cut);
+  if (sp <= 0) sp = cut;
+  a = src.substring(0, sp);
+  b = src.substring(src[sp] == ' ' ? sp + 1 : sp);
+}
+
 void drawDtc() {
   lcd.fillScreen(TFT_BLACK);
   lcd.setTextDatum(middle_center);
   lcd.setTextColor(TFT_LIGHTGREY);
+  lcd.setFont(&fonts::Font0);
   lcd.setTextSize(1);
   lcd.drawString("TROUBLE CODES", 120, 16);
 
@@ -1626,28 +1965,29 @@ void drawDtc() {
   }
 
   int y = 42, from = 0, shown = 0;
-  while (from < (int)dtcList.length() && shown < 5) {
-    int nl = dtcList.indexOf('\n', from);
+  while (from < (int)dtcList.length() && shown < 4) {
+    int nl = dtcList.indexOf(0x0A, from);
     String code = (nl < 0) ? dtcList.substring(from) : dtcList.substring(from, nl);
     String desc = dtcDescribe(code);
 
     lcd.setTextDatum(middle_center);
+    lcd.setFont(&fonts::Font0);
     lcd.setTextColor(TFT_RED);
     lcd.setTextSize(2);
     lcd.drawString(code, 120, y);
     y += 18;
+
     if (desc.length()) {
-      lcd.setTextColor(TFT_LIGHTGREY);
+      // Русский текст — своим шрифтом: во встроенном кириллицы нет.
+      lcd.setFont(&RuFont);
       lcd.setTextSize(1);
-      // перенос длинной строки на 2 части
-      if (desc.length() > 24) {
-        int sp = desc.lastIndexOf(' ', 24);
-        if (sp < 0) sp = 24;
-        lcd.drawString(desc.substring(0, sp), 120, y);       y += 12;
-        lcd.drawString(desc.substring(sp + 1), 120, y);      y += 16;
-      } else {
-        lcd.drawString(desc, 120, y);                        y += 20;
-      }
+      lcd.setTextColor(TFT_LIGHTGREY);
+      String l1, l2;
+      utf8Wrap(desc, 34, l1, l2);   // 34 символа по 6 px = 204 px
+      lcd.drawString(l1, 120, y); y += 11;
+      if (l2.length()) { lcd.drawString(l2, 120, y); y += 11; }
+      y += 6;
+      lcd.setFont(&fonts::Font0);
     } else {
       y += 8;
     }
@@ -1722,6 +2062,27 @@ void drawAlertOverlay(AlertKind k) {
     default: b[0] = 0;
   }
   if (b[0]) lcd.drawString(b, 120, 156);
+
+  // Для кода неисправности показываем сам код и его расшифровку:
+  // без них "DTC FAULT" ничего не говорит.
+  if (k == AL_NEWDTC && dtcList.length()) {
+    int nl = dtcList.indexOf(0x0A);
+    String code = (nl < 0) ? dtcList : dtcList.substring(0, nl);
+    lcd.setTextSize(2);
+    lcd.setTextColor(TFT_WHITE);
+    lcd.drawString(code, 120, 152);
+
+    String desc = dtcDescribe(code);
+    if (desc.length()) {
+      lcd.setFont(&RuFont);      // кириллица своим шрифтом
+      lcd.setTextSize(1);
+      String l1, l2;
+      utf8Wrap(desc, 30, l1, l2);
+      lcd.drawString(l1, 120, 176);
+      if (l2.length()) lcd.drawString(l2, 120, 188);
+      lcd.setFont(&fonts::Font0);
+    }
+  }
   lastK = k;
 }
 
@@ -1762,9 +2123,10 @@ void gotoScreen(Screen s) {
   if (s == SCREEN_DTC) dtcValid = false;    // перечитать коды при входе
 }
 
+void nextScreen() { gotoScreen((Screen)((currentScreen + 1) % SCREEN_COUNT)); }
 
 // ============================================================
-// КНОПКА (сенсорная TTP223, активна BTN_ACTIVE) — ПРИОРИТЕТНАЯ
+// КНОПКА BOOT (GPIO9, активна LOW) — ПРИОРИТЕТНАЯ
 // ============================================================
 // Таймер-ISR каждые 5 мс: ловит касание И СРАЗУ переключает currentScreen
 // (это просто присваивание — безопасно из ISR). Флаг screenChanged
@@ -1787,8 +2149,9 @@ void IRAM_ATTR btnTick() {
   static bool     armed  = true;
   static bool     holdFired = false;
 
-  // Короткое касание засчитываем по ОТПУСКАНИЮ: иначе долгое удержание
-  // сперва давало бы «тап», и выход из setup менял бы яркость заодно.
+  // Короткое касание засчитываем по ОТПУСКАНИЮ. Если считать по нажатию,
+  // то долгое удержание сперва даёт "тап" — экран переключается или
+  // меняется яркость по дороге в режим настройки.
   if (btnRaw()) {
     lowMs = 0;
     if (highMs < 60000) highMs++;
@@ -1798,8 +2161,7 @@ void IRAM_ATTR btnTick() {
       screenChanged = true;
     }
   } else {
-    // отпустили: если было короткое нажатие и оно не переросло в длинное —
-    // только теперь это «тап»
+    // отпустили: тап засчитываем только если удержание НЕ переросло в длинное
     if (armed && highMs >= BTN_HOLD_MS && !holdFired) {
       btnQueue = 1;
       screenChanged = true;
@@ -1815,7 +2177,7 @@ void IRAM_ATTR btnTick() {
 hw_timer_t* btnTimer = nullptr;
 
 void btnBegin() {
-  pinMode(BTN_PIN, INPUT);
+  pinMode(BTN_PIN, INPUT_PULLUP);   // BOOT замыкает на землю
   btnTimer = timerBegin(0, 80, true);          // 1 МГц
   timerAttachInterrupt(btnTimer, &btnTick, true);
   timerAlarmWrite(btnTimer, 1000, true);       // 1 мс — счётчики highMs/lowMs в мс
@@ -1831,6 +2193,7 @@ void btnBegin() {
 // AP стабильно на канале 1.
 void enterSetupMode() {
   Serial.println("=== SETUP MODE (hold) ===");
+  setupActive = true;
   const char* ssid = apSsidGlobal;
 
   elm.stop();
@@ -1890,11 +2253,18 @@ void enterSetupMode() {
       btnHoldQueue = 0;
       break;
     }
+    // выход по кнопке в веб-морде
+    if (setupExitReq) {
+      setupExitReq = false;
+      Serial.println("выход из setup по команде из веб-морды");
+      break;
+    }
     delay(2);
   }
 
   // --- выход: восстановить рабочий режим без рестарта ---
-  Serial.println("=== SETUP MODE exit (hold) ===");
+  setupActive = false;
+  Serial.println("=== SETUP MODE exit ===");
   lcd.fillScreen(TFT_BLACK);
   lcd.setTextColor(TFT_WHITE);
   lcd.setTextSize(1);
@@ -1939,11 +2309,12 @@ void setup() {
 
   bool disp = lcd.init();
   Serial.printf("lcd.init() -> %d\n", disp);
-  lcd.setRotation(2);   // экран перевёрнут на 180°
-  // Без cp437 LovyanGFX повторяет «классическое» поведение Adafruit-шрифта:
-  // любой код >= 176 сдвигается на +1 (lgfx_fonts.cpp: "Handle 'classic'
-  // charset behavior"). Наш знак градуса 0xF8 (248) рисовался бы глифом 249 —
-  // мелкой точкой, из-за чего температура на главном выглядела как пустая.
+  lcd.setRotation(0);   // ориентация «как есть» (было 2 — перевёрнуто)
+  // Кириллица приходит в UTF-8 (2 байта на букву) — декодер должен быть
+  // включён, иначе U8g2-шрифт не получит код символа. cp437 нужен, чтобы
+  // одиночный байт 0xF8 (знак градуса) не сдвигался на +1 во встроенном
+  // шрифте: библиотека повторяет «классическое» поведение Adafruit.
+  lcd.setAttribute(utf8_switch, true);
   lcd.setAttribute(cp437_switch, true);
   brightLoad(prefs);
   brightBegin();        // перехватить пин подсветки ПОСЛЕ инициализации LCD
@@ -2035,6 +2406,14 @@ void loop() {
     char c = Serial.read();
     if (c == 'L' || c == 'l') dlogDump();
     if (c == 'C' || c == 'c') { dlogClear(prefs); Serial.println("log cleared"); }
+    // Демо с USB: на столе сети может не быть, а веб-морда только по сети.
+    if (c == 'D' || c == 'd') {
+      demoOn = !demoOn;
+      brightSave(prefs);        // переживёт перезагрузку: открытие
+                                // COM-порта дёргает DTR и ресетит плату
+      dirtyFull = true;
+      Serial.printf("демо: %s" "\n", demoOn ? "ВКЛ" : "выкл");
+    }
     if (c == 'N' || c == 'n') {          // показать сохранённые сети
       Serial.printf("nets: count=%u\n", nets.count);
       for (int i = 0; i < NET_MAX; i++)
@@ -2142,8 +2521,9 @@ void loop() {
     } else if (!ready && millis() - tRedraw >= 300) {
       tRedraw = millis(); drawGaugeValues();
     }
-    // Сглаживание дуги — всегда и в одном месте, независимо от опроса:
-    // у дуги должен быть ровно один хозяин.
+    // Сглаживание дуги — ВСЕГДА и в одном месте, независимо от того,
+    // был ли в этом проходе опрос. Раньше анимация жила в else-ветке и
+    // спорила с drawGaugeValues() за одну и ту же дугу — дуга «кривила».
     static uint32_t tAnim = 0;
     if (millis() - tAnim >= 25) { tAnim = millis(); tachTick(); }
   }

@@ -7,22 +7,11 @@
 // единица, функция цвета (аномалии). Выбор — битовая маска в NVS.
 // ============================================================
 
-// ---- палитра ----
-#define C_WHITE  0xFFFF
-#define C_GREEN  0x07E0
-#define C_YELLOW 0xFFE0
-#define C_ORANGE 0xFD20
-#define C_RED    0xF800
-#define C_CYAN   0x07FF
-#define C_GREY   0x8410
-
 // сырые байты ответа PID (после mode+pid), их количество
 struct PidRaw { uint8_t b[6]; int n; };
 
 // значение параметра: число + строка для показа + цвет
-// text инициализируем строкой, а не пустым String: у пустого c_str()
-// на ESP32 равен nullptr, и отрисовка получала бы битый указатель.
-struct PidVal { float v = 0; bool valid = false; String text = "--"; uint16_t color = C_GREY; };
+struct PidVal { float v; bool valid; String text; uint16_t color; };
 
 typedef PidVal (*PidDecoder)(const PidRaw&);
 
@@ -34,10 +23,17 @@ struct PidDef {
   PidDecoder  decode;
 };
 
-static PidVal mk(float v, const String& t, uint16_t c) {
-  PidVal p; p.v = v; p.valid = true; p.text = t; p.color = c; return p;
-}
-static PidVal bad() { return PidVal(); }   // v=0, valid=false, text="--", серый
+// ---- палитра ----
+#define C_WHITE  0xFFFF
+#define C_GREEN  0x07E0
+#define C_YELLOW 0xFFE0
+#define C_ORANGE 0xFD20
+#define C_RED    0xF800
+#define C_CYAN   0x07FF
+#define C_GREY   0x8410
+
+static PidVal mk(float v, const String& t, uint16_t c) { return {v, true, t, c}; }
+static PidVal bad() { return {0, false, "--", C_GREY}; }
 
 // ---------- декодеры ----------
 static PidVal d_rpm(const PidRaw& r) {
@@ -52,7 +48,7 @@ static PidVal d_speed(const PidRaw& r) {
 static PidVal d_coolant(const PidRaw& r) {
   if (r.n < 1) return bad();
   int t = r.b[0] - 40;
-  uint16_t c = (t > 105) ? C_RED : (t > 95) ? C_ORANGE : (t < 60) ? C_CYAN : C_GREEN;
+  uint16_t c = (t >= 98) ? C_RED : (t < 50) ? C_CYAN : C_GREEN;
   return mk(t, String(t) + "C", c);
 }
 static PidVal d_iat(const PidRaw& r) {
@@ -114,6 +110,46 @@ static PidVal d_clrkm(const PidRaw& r) {           // пробег с очист
   return mk(km, String(km) + "km", C_WHITE);
 }
 
+// Напряжение на разъёме OBD: меряет САМ адаптер (команда ATRV), ЭБУ не
+// участвует. Поэтому mode 0xFF — опросчик знает, что это не PID.
+static PidVal d_obdv(const PidRaw& r) {
+  if (r.n < 2) return bad();
+  float v = ((r.b[0] << 8) | r.b[1]) / 100.0f;   // сотые вольта
+  uint16_t c = (v < 11.8 || v > 14.8) ? C_ORANGE : (v < 12.2) ? C_YELLOW : C_GREEN;
+  return mk(v, String(v, 1) + "V", c);
+}
+
+static PidVal d_oiltemp(const PidRaw& r) {        // температура масла ДВС (PID 015C)
+  if (r.n < 1) return bad();
+  int t = r.b[0] - 40;
+  uint16_t c = (t >= 125) ? C_RED : (t < 60) ? C_CYAN : C_GREEN;
+  return mk(t, String(t) + "\xF8" "C", c);
+}
+static PidVal d_fuelrate(const PidRaw& r) {       // мгновенный расход, л/ч (PID 015E)
+  if (r.n < 2) return bad();
+  float lph = ((r.b[0] << 8) | r.b[1]) * 0.05f;
+  return mk(lph, String(lph, 1) + "L/h", C_WHITE);
+}
+
+// Мгновенный и средний расход на 100 км. Считаются НЕ по одному PID:
+// нужны расход топлива и скорость вместе. Значения кладёт опросчик
+// (mode 0xFE), здесь только формат и цвет.
+static PidVal d_lpk(const PidRaw& r) {            // л/100 км сейчас
+  if (r.n < 2) return bad();
+  int v = (r.b[0] << 8) | r.b[1];                 // сотые доли
+  if (v >= 9999) return mk(0, "--", C_GREY);      // стоим: расход на 100 км не определён
+  float l = v / 100.0f;
+  uint16_t c = (l > 15) ? C_ORANGE : (l > 10) ? C_YELLOW : C_GREEN;
+  return mk(l, String(l, 1), c);
+}
+static PidVal d_lpkavg(const PidRaw& r) {         // л/100 км в среднем за поездку
+  if (r.n < 2) return bad();
+  int v = (r.b[0] << 8) | r.b[1];
+  if (v >= 9999) return mk(0, "--", C_GREY);
+  float l = v / 100.0f;
+  return mk(l, String(l, 1), C_WHITE);
+}
+
 // ============================================================
 // Таблица параметров. Порядок = порядок битов в маске NVS.
 // ============================================================
@@ -132,6 +168,11 @@ static const PidDef PID_DEFS[] = {
   {"ecuv",   "ECU V",  0x01, 0x42, d_ecuv},
   {"milkm",  "MIL km", 0x01, 0x21, d_milkm},
   {"clrkm",  "CLR km", 0x01, 0x31, d_clrkm},
+  {"obdv",   "OBD V",  0xFF, 0x00, d_obdv},   // ATRV — напряжение на разъёме
+  {"oilt",   "OIL T",  0x01, 0x5C, d_oiltemp}, // температура масла ДВС
+  {"frate",  "FUEL/h", 0x01, 0x5E, d_fuelrate},// мгновенный расход, л/ч
+  {"lpk",    "L/100",  0xFE, 0x01, d_lpk},     // расход на 100 км сейчас
+  {"lpkavg", "L/100~", 0xFE, 0x02, d_lpkavg},  // средний за поездку
 };
 static const int PID_DEFS_LEN = sizeof(PID_DEFS) / sizeof(PID_DEFS[0]);
 
